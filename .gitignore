@@ -1,0 +1,12 @@
+# Entornos y temporales
+__pycache__/
+*.pyc
+.venv/
+env/
+
+# Directorios de pruebas e imágenes
+input/*
+!input/.gitkeep
+output/*
+!output/.gitkeep
+scratch/
