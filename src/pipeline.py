@@ -54,9 +54,97 @@ def ordenar_puntos_esquinas(pts):
 
     return rect
 
+def _mascaras_candidatas(mini):
+    """
+    Genera varias máscaras binarias del posible papel. Cada estrategia funciona
+    mejor en escenarios distintos (escritorio oscuro, madera, poco contraste).
+    """
+    grises = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(grises, (5, 5), 0)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+
+    # 1. Bordes Canny con umbrales derivados de la mediana de la imagen.
+    mediana = float(np.median(blurred))
+    bajo = int(max(10, 0.66 * mediana))
+    alto = int(min(255, 1.33 * mediana))
+    bordes = cv2.Canny(blurred, bajo, alto)
+    yield cv2.morphologyEx(bordes, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # 2. El papel es la región más clara: Otsu sobre la luminosidad.
+    _, otsu = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield cv2.morphologyEx(otsu, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    # 3. El papel tiene saturación baja frente a mesas de madera o color.
+    hsv = cv2.cvtColor(mini, cv2.COLOR_BGR2HSV)
+    saturacion = cv2.GaussianBlur(hsv[:, :, 1], (5, 5), 0)
+    _, baja_sat = cv2.threshold(saturacion, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    yield cv2.morphologyEx(baja_sat, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+
+# Las 4 esquinas reales corrigen la perspectiva; el rectángulo rotado solo endereza.
+PRIORIDAD_ESQUINAS_REALES = 0
+PRIORIDAD_RECTANGULO_ROTADO = 1
+
+
+def _cuadrilateros_de_mascara(mascara, area_total):
+    """
+    Devuelve los cuadriláteros plausibles (4 esquinas) encontrados en una máscara.
+    """
+    contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contornos = sorted(contornos, key=cv2.contourArea, reverse=True)[:5]
+
+    encontrados = []
+    for c in contornos:
+        if cv2.contourArea(c) < area_total * config.PORCENTAJE_MIN_COBERTURA_PAPEL:
+            continue
+
+        casco = cv2.convexHull(c)
+        perimetro = cv2.arcLength(casco, True)
+
+        candidatos = []
+        for factor in (0.01, 0.02, 0.03, 0.05):
+            approx = cv2.approxPolyDP(casco, factor * perimetro, True)
+            if len(approx) == 4:
+                candidatos.append((PRIORIDAD_ESQUINAS_REALES, approx.reshape(4, 2).astype("float32")))
+        # Rectángulo rotado como red de seguridad cuando el borde está incompleto.
+        candidatos.append((PRIORIDAD_RECTANGULO_ROTADO, cv2.boxPoints(cv2.minAreaRect(casco)).astype("float32")))
+
+        for prioridad, pts in candidatos:
+            area_quad = cv2.contourArea(pts.astype(np.float32))
+            if not area_total * config.PORCENTAJE_MIN_COBERTURA_PAPEL <= area_quad <= area_total * config.PORCENTAJE_MAX_COBERTURA_PAPEL:
+                continue
+
+            (_, (w_rot, h_rot), _) = cv2.minAreaRect(pts.astype(np.float32))
+            if w_rot < 1 or h_rot < 1:
+                continue
+
+            solidez = area_quad / (w_rot * h_rot)
+            if solidez < config.SOLIDEZ_MIN_CUADRILATERO:
+                continue
+
+            aspecto = w_rot / h_rot
+            if not config.RELACION_ASPECTO_MIN <= aspecto <= config.RELACION_ASPECTO_MAX:
+                continue
+
+            encontrados.append((prioridad, area_quad * solidez, pts))
+
+    return encontrados
+
+
+def _expandir_esquinas(pts, margen, limite_ancho, limite_alto):
+    """
+    Aleja cada esquina del centro un porcentaje del tamaño, sin salir de la imagen.
+    """
+    centro = pts.mean(axis=0)
+    expandidas = centro + (pts - centro) * (1.0 + margen)
+    expandidas[:, 0] = np.clip(expandidas[:, 0], 0, limite_ancho - 1)
+    expandidas[:, 1] = np.clip(expandidas[:, 1], 0, limite_alto - 1)
+    return expandidas.astype("float32")
+
+
 def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MINIATURA_ANALISIS):
     """
-    Detección ultra-conservadora de bordes externos de la hoja de papel.
+    Detecta los bordes externos de la hoja de papel y corrige la perspectiva.
     """
     alto_orig, ancho_orig = imagen_bgr.shape[:2]
     
@@ -69,40 +157,22 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         mini = imagen_bgr.copy()
         escala = 1.0
 
-    grises = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(grises, (5, 5), 0)
-    canny = cv2.Canny(blurred, 30, 120)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    dilated = cv2.dilate(canny, kernel, iterations=1)
-
-    contornos, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contornos = sorted(contornos, key=cv2.contourArea, reverse=True)[:5]
-
     area_total_mini = mini.shape[0] * mini.shape[1]
-    esquinas_halladas = None
+    candidatos = []
+    for mascara in _mascaras_candidatas(mini):
+        candidatos.extend(_cuadrilateros_de_mascara(mascara, area_total_mini))
 
-    for c in contornos:
-        area_c = cv2.contourArea(c)
-        if area_c < area_total_mini * config.PORCENTAJE_MIN_COBERTURA_PAPEL:
-            continue
-
-        perimetro = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * perimetro, True)
-
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            pts = approx.reshape(4, 2)
-            x, y, w, h = cv2.boundingRect(pts)
-            aspect_ratio = w / float(h)
-            if 0.4 <= aspect_ratio <= 2.2:
-                esquinas_halladas = pts
-                break
-
-    if esquinas_halladas is None:
+    if not candidatos:
         return imagen_bgr, False
+
+    mejor_prioridad = min(c[0] for c in candidatos)
+    esquinas_halladas = max(
+        (c for c in candidatos if c[0] == mejor_prioridad), key=lambda c: c[1]
+    )[2]
 
     pts_mini = ordenar_puntos_esquinas(esquinas_halladas.astype("float32"))
     pts_orig = pts_mini / escala
+    pts_orig = _expandir_esquinas(pts_orig, config.MARGEN_EXTRA_RECORTE, ancho_orig, alto_orig)
 
     (tl, tr, br, bl) = pts_orig
 

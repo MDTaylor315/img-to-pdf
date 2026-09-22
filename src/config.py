@@ -35,11 +35,26 @@ CALIDAD_JPEG = 88
 MODO_PROCESAMIENTO_DEFECTO = "magico"
 
 # Activar o desactivar recorte automático de perspectiva por defecto.
-# RECOMENDACIÓN: False para no arriesgar recorte de cabeceras en fotos cerradas.
-USAR_AUTO_CROP_DEFECTO = False
+USAR_AUTO_CROP_DEFECTO = True
 
-# Umbral mínimo de cobertura de papel para justificar auto-crop (0.70 = 70% de la foto).
-PORCENTAJE_MIN_COBERTURA_PAPEL = 0.70
+# Umbral mínimo de cobertura de papel para justificar auto-crop (0.08 = 8% de la foto).
+# Bajarlo permite recortar fotos donde el papel ocupa poco (papel sobre escritorio).
+PORCENTAJE_MIN_COBERTURA_PAPEL = 0.08
+
+# Cobertura máxima: si el candidato ocupa casi toda la foto no hay nada que recortar.
+PORCENTAJE_MAX_COBERTURA_PAPEL = 0.985
+
+# Relación de aspecto aceptada para la hoja detectada (ancho / alto).
+RELACION_ASPECTO_MIN = 0.25
+RELACION_ASPECTO_MAX = 4.0
+
+# Solidez mínima: área del cuadrilátero respecto al rectángulo rotado que lo contiene.
+# Descarta formas irregulares (sombras, manchas del escritorio) que no son una hoja.
+SOLIDEZ_MIN_CUADRILATERO = 0.80
+
+# Margen de seguridad añadido alrededor de la hoja detectada (0.01 = 1% del tamaño).
+# Evita cortar cabeceras o el borde mismo del papel.
+MARGEN_EXTRA_RECORTE = 0.01
 
 
 # --- AJUSTE FINO DE IMAGEN (FILTRO MÁGICO) ---
