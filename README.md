@@ -10,7 +10,7 @@ Diseñado específicamente para consumo cero de archivos basura en disco duro, b
   * Blanqueamiento de fondo uniforme (RGB 255) eliminando sombras de celular, manos o luz ambiente tenue.
   * Ecualización de contraste local CLAHE + curva LUT no lineal para tinta, firmas a mano y sellos oscuros.
   * Nitidez y enfoque adaptativo para texto claro y códigos de barras.
-* **Auto-Crop Seguro:** Detección conservadora de bordes de papel de 4 esquinas sin recortar tablas ni cabeceras por error.
+* **Auto-Crop Multi-Estrategia (activado por defecto):** Detecta la hoja combinando bordes Canny adaptativos, umbral Otsu de luminosidad y baja saturación (papel sobre madera o escritorio oscuro), corrige la perspectiva a las 4 esquinas reales y deja un margen de seguridad para no cortar cabeceras.
 * **Optimizado para Servidores (Zero-Hog):**
   * Límite de hilos de CPU por proceso (`NUM_HILOS_OPENCV = 1`) para evitar picos en horas punta.
   * Análisis de contornos en miniaturas a 800px (<10ms).
