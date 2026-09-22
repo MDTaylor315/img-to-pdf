@@ -52,9 +52,13 @@ RELACION_ASPECTO_MAX = 4.0
 # Descarta formas irregulares (sombras, manchas del escritorio) que no son una hoja.
 SOLIDEZ_MIN_CUADRILATERO = 0.80
 
+# Fracción mínima del perímetro del recorte que debe caer sobre bordes reales.
+# Descarta recortes que engloban mesa o pared además del papel.
+ALINEACION_MIN_BORDES = 0.12
+
 # Margen de seguridad añadido alrededor de la hoja detectada (0.01 = 1% del tamaño).
 # Evita cortar cabeceras o el borde mismo del papel.
-MARGEN_EXTRA_RECORTE = 0.01
+MARGEN_EXTRA_RECORTE = 0.02
 
 
 # --- AJUSTE FINO DE IMAGEN (FILTRO MÁGICO) ---

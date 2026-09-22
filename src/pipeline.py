@@ -54,20 +54,26 @@ def ordenar_puntos_esquinas(pts):
 
     return rect
 
-def _mascaras_candidatas(mini):
+def _mapa_bordes(mini):
+    """
+    Bordes Canny con umbrales derivados de la mediana de la imagen.
+    """
+    blurred = cv2.GaussianBlur(cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    mediana = float(np.median(blurred))
+    bajo = int(max(10, 0.66 * mediana))
+    alto = int(min(255, 1.33 * mediana))
+    return cv2.Canny(blurred, bajo, alto)
+
+
+def _mascaras_candidatas(mini, bordes):
     """
     Genera varias máscaras binarias del posible papel. Cada estrategia funciona
     mejor en escenarios distintos (escritorio oscuro, madera, poco contraste).
     """
-    grises = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(grises, (5, 5), 0)
+    blurred = cv2.GaussianBlur(cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY), (5, 5), 0)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
 
-    # 1. Bordes Canny con umbrales derivados de la mediana de la imagen.
-    mediana = float(np.median(blurred))
-    bajo = int(max(10, 0.66 * mediana))
-    alto = int(min(255, 1.33 * mediana))
-    bordes = cv2.Canny(blurred, bajo, alto)
+    # 1. Contorno cerrado a partir de los bordes de la hoja.
     yield cv2.morphologyEx(bordes, cv2.MORPH_CLOSE, kernel, iterations=2)
 
     # 2. El papel es la región más clara: Otsu sobre la luminosidad.
@@ -80,13 +86,32 @@ def _mascaras_candidatas(mini):
     _, baja_sat = cv2.threshold(saturacion, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     yield cv2.morphologyEx(baja_sat, cv2.MORPH_CLOSE, kernel, iterations=2)
 
+    # 4. Otsu tras igualar la iluminación: recupera la hoja entera cuando una
+    # esquina queda en sombra y el umbral global la partiría en dos.
+    igualada = cv2.GaussianBlur(corregir_iluminacion_suave(cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)), (5, 5), 0)
+    _, otsu_igualada = cv2.threshold(igualada, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield cv2.morphologyEx(otsu_igualada, cv2.MORPH_CLOSE, kernel, iterations=2)
+
 
 # Las 4 esquinas reales corrigen la perspectiva; el rectángulo rotado solo endereza.
 PRIORIDAD_ESQUINAS_REALES = 0
 PRIORIDAD_RECTANGULO_ROTADO = 1
 
 
-def _cuadrilateros_de_mascara(mascara, area_total):
+def _alineacion_con_bordes(pts, bordes_dilatados):
+    """
+    Fracción del perímetro del cuadrilátero que cae sobre bordes reales de la foto.
+    Penaliza recortes que engloban mesa o pared además del papel.
+    """
+    lienzo = np.zeros(bordes_dilatados.shape, np.uint8)
+    cv2.polylines(lienzo, [pts.astype(np.int32)], True, 255, 3)
+    total = int(np.count_nonzero(lienzo))
+    if total == 0:
+        return 0.0
+    return float(np.count_nonzero(cv2.bitwise_and(lienzo, bordes_dilatados))) / total
+
+
+def _cuadrilateros_de_mascara(mascara, area_total, bordes_dilatados):
     """
     Devuelve los cuadriláteros plausibles (4 esquinas) encontrados en una máscara.
     """
@@ -126,7 +151,11 @@ def _cuadrilateros_de_mascara(mascara, area_total):
             if not config.RELACION_ASPECTO_MIN <= aspecto <= config.RELACION_ASPECTO_MAX:
                 continue
 
-            encontrados.append((prioridad, area_quad * solidez, pts))
+            alineacion = _alineacion_con_bordes(pts, bordes_dilatados)
+            if alineacion < config.ALINEACION_MIN_BORDES:
+                continue
+
+            encontrados.append((prioridad, area_quad * solidez * alineacion, pts))
 
     return encontrados
 
@@ -158,9 +187,12 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         escala = 1.0
 
     area_total_mini = mini.shape[0] * mini.shape[1]
+    bordes = _mapa_bordes(mini)
+    bordes_dilatados = cv2.dilate(bordes, np.ones((7, 7), np.uint8))
+
     candidatos = []
-    for mascara in _mascaras_candidatas(mini):
-        candidatos.extend(_cuadrilateros_de_mascara(mascara, area_total_mini))
+    for mascara in _mascaras_candidatas(mini, bordes):
+        candidatos.extend(_cuadrilateros_de_mascara(mascara, area_total_mini, bordes_dilatados))
 
     if not candidatos:
         return imagen_bgr, False
