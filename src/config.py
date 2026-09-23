@@ -1,3 +1,5 @@
+import os
+
 # ==============================================================================
 # CONFIGURACIÓN DEL SISTEMA DE ESCANEO DE IMÁGENES A PDF (MontanoImagen)
 # Modifica estos valores para controlar la calidad y la carga del servidor.
@@ -27,7 +29,7 @@ LIMPIAR_RAM_POR_PAGINA = True
 # --- PARAMETROS DE CALIDAD Y COMPRESIÓN ---
 # Calidad de compresión JPEG guardado en RAM (1 a 100).
 # 84 - 88: Balance perfecto de nitidez en firmas/texto con bajo peso (~200 KB por hoja).
-CALIDAD_JPEG = 88
+CALIDAD_JPEG = 95
 
 # Modo de procesamiento por defecto:
 # - "magico": Escáner HD profesional (fondo blanco pulcro, texto y sellos oscuros).
@@ -36,10 +38,25 @@ MODO_PROCESAMIENTO_DEFECTO = "magico"
 
 # Activar o desactivar recorte automático de perspectiva por defecto.
 # RECOMENDACIÓN: False para no arriesgar recorte de cabeceras en fotos cerradas.
-USAR_AUTO_CROP_DEFECTO = False
+USAR_AUTO_CROP_DEFECTO = True
 
-# Umbral mínimo de cobertura de papel para justificar auto-crop (0.70 = 70% de la foto).
-PORCENTAJE_MIN_COBERTURA_PAPEL = 0.70
+# Umbral mínimo de cobertura de papel para justificar auto-crop (0.20 = 20% de la foto).
+PORCENTAJE_MIN_COBERTURA_PAPEL = 0.20
+
+# Umbral máximo de cobertura de papel (0.98). Permite recortar el papel de la foto
+# descartando fondos, mesas y contornos no deseados alrededor de la hoja.
+PORCENTAJE_MAX_COBERTURA_PAPEL = 0.98
+
+
+# Activar o desactivar auto-orientación por defecto.
+# Corrige fotos tomadas con el celular mirando a una mesa cuando el giroscopio se confunde (90°/270°/180°).
+AUTO_ORIENTAR_TEXTO_DEFECTO = True
+
+# --- CLASIFICACIÓN DE ORIENTACIÓN INTELIGENTE (ONNX) ---
+# Modelo ONNX ultraligero (~6 MB) evaluado con OpenCV DNN (cv2.dnn) en ~7ms.
+# Detecta y corrige con precisión rotaciones de 0°, 90°, 180° y 270°.
+USAR_MODELO_ORIENTACION_ONNX = True
+MODELO_ORIENTACION_PATH = os.path.join(os.path.dirname(__file__), "models", "rapid_orientation.onnx")
 
 
 # --- AJUSTE FINO DE IMAGEN (FILTRO MÁGICO) ---
@@ -48,3 +65,14 @@ CLIP_LIMIT_CLAHE = 1.5
 
 # Fuerza del filtro de nitidez / unsharp mask (1.0 a 2.0).
 FUERZA_NITIDEZ = 1.2
+
+
+# --- VALIDACIONES DE ENTRADA DEL ENDPOINT ---
+# Límites para evitar que una petición consuma demasiada memoria o CPU.
+MAX_CANTIDAD_FOTOS = 50
+MAX_BYTES_POR_FOTO = 10 * 1024 * 1024
+MAX_BYTES_TOTALES = 50 * 1024 * 1024
+MAX_PIXELES_POR_FOTO = 25_000_000
+
+# Formatos que el pipeline acepta después de inspeccionar el contenido real.
+FORMATOS_IMAGEN_PERMITIDOS = frozenset({"JPEG", "PNG", "WEBP"})
