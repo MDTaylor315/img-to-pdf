@@ -175,10 +175,18 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
             approx = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
             if len(approx) == 4:
                 mask = np.zeros_like(grises)
-                cv2.drawContours(mask, [c], -1, 255, -1)
+                cv2.drawContours(mask, [approx], -1, 255, -1)
                 brillo_promedio = cv2.mean(grises, mask=mask)[0]
-                candidatos_quad.append((brillo_promedio, pct, approx))
 
+                # Comprobar el anillo exterior al cuadrilátero para distinguir
+                # el borde real de la hoja vs una tabla interna impresa en papel blanco
+                mask_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))) - mask
+                brillo_ring = cv2.mean(grises, mask=mask_ring)[0]
+
+                # La hoja de papel sobre una mesa o teclado tiene un exterior oscuro (brillo_ring < 125)
+                # o una caída notable de luminosidad. Una tabla interna tiene más papel blanco afuera (~180).
+                if (brillo_promedio - brillo_ring >= 25) or (brillo_ring < 125):
+                    candidatos_quad.append((brillo_promedio, pct, approx))
 
     if candidatos_quad:
         # La hoja de papel es siempre el cuadrilátero con mayor reflectancia/brillo blanco
@@ -189,48 +197,85 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         if ok:
             return desdoblada, True
 
-    # --- TIER 2: RESPALDO CONSERVADOR POR UMBRALIZACIÓN ---
-    _, thresh_paper = cv2.threshold(grises, 135, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    # --- TIER 2: DELIMITACIÓN DE HOJA Y ELIMINACIÓN DE FONDO/ESCRITORIO ---
+    _, thresh_paper = cv2.threshold(grises, 125, 255, cv2.THRESH_BINARY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
     clean_paper = cv2.morphologyEx(thresh_paper, cv2.MORPH_CLOSE, kernel)
 
     contornos, _ = cv2.findContours(clean_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contornos:
         return imagen_bgr, False
 
-    todos_contornos = sorted(contornos, key=cv2.contourArea, reverse=True)
+    c = max(contornos, key=cv2.contourArea)
+    area_c = cv2.contourArea(c)
+    pct_area = area_c / float(area_total_mini)
 
-    for c in todos_contornos:
-        area_c = cv2.contourArea(c)
-        pct_area = area_c / float(area_total_mini)
+    # Protección de plano cerrado (la foto ya abarca casi toda la pantalla)
+    if pct_area > config.PORCENTAJE_MAX_COBERTURA_PAPEL:
+        return imagen_bgr, False
 
-        if pct_area > config.PORCENTAJE_MAX_COBERTURA_PAPEL:
-            return imagen_bgr, False
+    if pct_area < config.PORCENTAJE_MIN_COBERTURA_PAPEL:
+        return imagen_bgr, False
 
-        if pct_area < config.PORCENTAJE_MIN_COBERTURA_PAPEL:
-            continue
+    bx, by, bw, bh = cv2.boundingRect(c)
 
-        x, y, w, h = cv2.boundingRect(c)
+    # Ignorar marco exterior completo
+    if bw > 0.96 * ancho_mini and bh > 0.96 * alto_mini and pct_area > 0.85:
+        return imagen_bgr, False
 
-        # Ignorar marco exterior completo
-        if (w > 0.96 * ancho_mini and h > 0.96 * alto_mini):
-            continue
+    # 1. Borde inferior (mesa de abajo):
+    row_means = np.mean(grises, axis=1)
+    y_bot = by + bh
+    for y in range(min(alto_mini - 1, by + bh), by + int(bh * 0.4), -1):
+        if row_means[y] > 115:
+            y_bot = y
+            break
 
-        # Recortar pedazos de papel secundarios o sueltos a los lados
-        x, y, w, h = recortar_recortes_secundarios_papel(clean_paper, x, y, w, h)
+    # 2. Borde derecho (mesa lateral):
+    mid_y1 = by + int((y_bot - by) * 0.4)
+    mid_y2 = by + int((y_bot - by) * 0.8)
+    if mid_y2 > mid_y1:
+        col_means = np.mean(grises[mid_y1:mid_y2, :], axis=0)
+        x_right = bx + bw
+        for x in range(min(ancho_mini - 1, bx + bw), bx + int(bw * 0.5), -1):
+            if col_means[x] > 120:
+                x_right = x
+                break
+    else:
+        x_right = bx + bw
 
-        pad_x = int(w * 0.005)
-        pad_y = int(h * 0.005)
-        x1 = max(0, x - pad_x)
-        y1 = max(0, y - pad_y)
-        x2 = min(ancho_mini, x + w + pad_x)
-        y2 = min(alto_mini, y + h + pad_y)
+    # 3. Borde superior (hoja secundaria o mesa en esquina superior):
+    x_probe = max(0, x_right - int(bw * 0.1))
+    col_probe = grises[by:by + int(bh * 0.5), x_probe]
+    y_top = by
+    if len(col_probe) > 10 and (col_probe[0] < 125 or np.mean(col_probe[:10]) < 130):
+        for y_idx in range(len(col_probe)):
+            if col_probe[y_idx] > 150:
+                y_top = by + y_idx
+                break
 
-        rx1, ry1 = int(x1 / escala), int(y1 / escala)
-        rx2, ry2 = int(x2 / escala), int(y2 / escala)
+    # 4. Borde izquierdo (mesa en esquina inferior izquierda si existe):
+    row_top = grises[min(alto_mini - 1, y_top + 20), :]
+    row_bot = grises[max(0, y_bot - 20), :]
+    pts_top = np.where(row_top > 120)[0]
+    pts_bot = np.where(row_bot > 120)[0]
+    x_left = bx
+    if len(pts_bot) > 0 and pts_bot[0] > bx + int(bw * 0.05):
+        if len(pts_top) > 0 and pts_top[0] > bx + int(bw * 0.05):
+            x_left = min(pts_top[0], pts_bot[0])
+        else:
+            x_left = pts_bot[0]
 
-        recortada = imagen_bgr[ry1:ry2, rx1:rx2]
-        return recortada, True
+    rx1 = max(0, int(x_left / escala))
+    ry1 = max(0, int(y_top / escala))
+    rx2 = min(ancho_orig, int(x_right / escala))
+    ry2 = min(alto_orig, int(y_bot / escala))
+
+    if rx2 - rx1 < 50 or ry2 - ry1 < 50:
+        return imagen_bgr, False
+
+    recortada = imagen_bgr[ry1:ry2, rx1:rx2]
+    return recortada, True
 
     return imagen_bgr, False
 
