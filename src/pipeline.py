@@ -199,7 +199,7 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
 
     # --- TIER 2: DELIMITACIÓN DE HOJA Y ELIMINACIÓN DE FONDO/ESCRITORIO ---
     _, thresh_paper = cv2.threshold(grises, 125, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
     clean_paper = cv2.morphologyEx(thresh_paper, cv2.MORPH_CLOSE, kernel)
 
     contornos, _ = cv2.findContours(clean_paper, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -210,61 +210,139 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     area_c = cv2.contourArea(c)
     pct_area = area_c / float(area_total_mini)
 
-    # Protección de plano cerrado (la foto ya abarca casi toda la pantalla)
-    if pct_area > config.PORCENTAJE_MAX_COBERTURA_PAPEL:
-        return imagen_bgr, False
-
+    # Si el contorno es diminuto (< 20%), no recortar
     if pct_area < config.PORCENTAJE_MIN_COBERTURA_PAPEL:
         return imagen_bgr, False
 
-    bx, by, bw, bh = cv2.boundingRect(c)
+    # 1. Intentar recorte por rectángulo inscrito de cuadrilátero envolvente (Garantía de Cero Escritorio)
+    hull = cv2.convexHull(c)
+    quad_pts = None
+    for eps in [0.015, 0.02, 0.025, 0.03, 0.04]:
+        approx = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
+        if len(approx) == 4:
+            pts = approx.reshape(-1, 2)
+            rect = np.zeros((4, 2), dtype='float32')
+            s = pts.sum(axis=1)
+            rect[0] = pts[np.argmin(s)]  # TL
+            rect[2] = pts[np.argmax(s)]  # BR
+            diff = np.diff(pts, axis=1)
+            rect[1] = pts[np.argmin(diff)] # TR
+            rect[3] = pts[np.argmax(diff)] # BL
+            quad_pts = rect
+            break
 
-    # Ignorar marco exterior completo
-    if bw > 0.96 * ancho_mini and bh > 0.96 * alto_mini and pct_area > 0.85:
+    if quad_pts is not None:
+        TL, TR, BR, BL = quad_pts
+        # Si hay un papel secundario o recibo adjunto en la esquina inferior derecha
+        br_x = TR[0] if BR[0] > TR[0] + (50 * escala) else BR[0]
+        br_y = BL[1] if BR[0] > TR[0] + (50 * escala) else BR[1]
+
+        x1 = int(max(0, max(TL[0], BL[0])))
+        y1 = int(max(0, max(TL[1], TR[1])))
+        x2 = int(min(ancho_mini, min(TR[0], br_x)))
+        y2 = int(min(alto_mini, min(BL[1], br_y)))
+
+        # Refinamiento contra esquinas con escritorio visible o papel secundario desfasado (ej. gd-1, gd-2):
+        # Si la fila o columna exterior contiene fondo/escritorio (0 en clean_paper),
+        # avanzamos el límite hacia el interior hasta delimitar exclusivamente la hoja principal.
+        max_dy = int((y2 - y1) * 0.35)
+        max_dx = int((x2 - x1) * 0.35)
+        y1_lim = y1 + max_dy
+        while y1 < y1_lim and np.mean(clean_paper[y1, x1:x2] == 0) > 0.03:
+            y1 += 1
+        y2_lim = y2 - max_dy
+        while y2 > y2_lim and np.mean(clean_paper[y2 - 1, x1:x2] == 0) > 0.03:
+            y2 -= 1
+        x1_lim = x1 + max_dx
+        while x1 < x1_lim and np.mean(clean_paper[y1:y2, x1] == 0) > 0.03:
+            x1 += 1
+        x2_lim = x2 - max_dx
+        while x2 > x2_lim and np.mean(clean_paper[y1:y2, x2 - 1] == 0) > 0.03:
+            x2 -= 1
+
+        rx1 = int(x1 / escala)
+        ry1 = int(y1 / escala)
+        rx2 = int(x2 / escala)
+        ry2 = int(y2 / escala)
+
+        # Margen de seguridad fino (~1%) para podar rasgados de esquinas o sombras perimetrales
+        pad_x = int(0.012 * (rx2 - rx1))
+        pad_y = int(0.008 * (ry2 - ry1))
+        rx1 = min(ancho_orig, rx1 + pad_x)
+        rx2 = max(0, rx2 - pad_x)
+        ry1 = min(alto_orig, ry1 + pad_y)
+        ry2 = max(0, ry2 - pad_y)
+
+        if rx2 - rx1 > 100 and ry2 - ry1 > 100:
+            return imagen_bgr[ry1:ry2, rx1:rx2], True
+
+    # 2. Respaldo: Corrección de leve inclinación (deskew) y delimitación ortogonal
+    rect = cv2.minAreaRect(c)
+    (cx, cy), (rw, rh), angle = rect
+    if rw < rh:
+        rw, rh = rh, rw
+        angle += 90.0
+    while angle > 45:
+        angle -= 90
+    while angle < -45:
+        angle += 90
+
+    if abs(angle) > 0.5:
+        centro = (ancho_orig / 2.0, alto_orig / 2.0)
+        M_orig = cv2.getRotationMatrix2D(centro, angle, 1.0)
+        imagen_rotada = cv2.warpAffine(imagen_bgr, M_orig, (ancho_orig, alto_orig), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        mini_centro = (ancho_mini / 2.0, alto_mini / 2.0)
+        M_mini = cv2.getRotationMatrix2D(mini_centro, angle, 1.0)
+        clean_rot = cv2.warpAffine(clean_paper, M_mini, (ancho_mini, alto_mini), flags=cv2.INTER_NEAREST)
+    else:
+        imagen_rotada = imagen_bgr
+        clean_rot = clean_paper
+
+    rot_cnts, _ = cv2.findContours(clean_rot, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not rot_cnts:
+        return imagen_bgr, False
+    c_rot = max(rot_cnts, key=cv2.contourArea)
+    bx, by, bw, bh = cv2.boundingRect(c_rot)
+
+    # Si la imagen ya es 100% papel blanco en todos sus márgenes exteriores, no recortar
+    top_p = np.mean(clean_rot[0, :] > 0)
+    bot_p = np.mean(clean_rot[-1, :] > 0)
+    left_p = np.mean(clean_rot[:, 0] > 0)
+    right_p = np.mean(clean_rot[:, -1] > 0)
+    if top_p > 0.95 and bot_p > 0.95 and left_p > 0.95 and right_p > 0.95 and pct_area > 0.85:
         return imagen_bgr, False
 
-    # 1. Borde inferior (mesa de abajo):
-    row_means = np.mean(grises, axis=1)
+    # Delimitar límites donde el cuerpo del papel es continuo (sin escritorio)
+    mid_y1 = by + int(bh * 0.25)
+    mid_y2 = by + int(bh * 0.75)
+    cols_in_body = np.mean(clean_rot[mid_y1:mid_y2, :] > 0, axis=0)
+    valid_cols = np.where(cols_in_body > 0.75)[0]
+    if len(valid_cols) == 0:
+        return imagen_bgr, False
+    x_left = valid_cols[0]
+    x_right = valid_cols[-1]
+
+    y_top = by
+    for y in range(by, by + int(bh * 0.5)):
+        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.88:
+            y_top = y
+            break
+
     y_bot = by + bh
-    for y in range(min(alto_mini - 1, by + bh), by + int(bh * 0.4), -1):
-        if row_means[y] > 115:
+    for y in range(by + bh - 1, by + int(bh * 0.4), -1):
+        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.88:
             y_bot = y
             break
 
-    # 2. Borde derecho (mesa lateral):
-    mid_y1 = by + int((y_bot - by) * 0.4)
-    mid_y2 = by + int((y_bot - by) * 0.8)
-    if mid_y2 > mid_y1:
-        col_means = np.mean(grises[mid_y1:mid_y2, :], axis=0)
-        x_right = bx + bw
-        for x in range(min(ancho_mini - 1, bx + bw), bx + int(bw * 0.5), -1):
-            if col_means[x] > 120:
-                x_right = x
-                break
-    else:
-        x_right = bx + bw
+    for x in range(x_left, x_left + int((x_right - x_left) * 0.2)):
+        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.88:
+            x_left = x
+            break
 
-    # 3. Borde superior (hoja secundaria o mesa en esquina superior):
-    x_probe = max(0, x_right - int(bw * 0.1))
-    col_probe = grises[by:by + int(bh * 0.5), x_probe]
-    y_top = by
-    if len(col_probe) > 10 and (col_probe[0] < 125 or np.mean(col_probe[:10]) < 130):
-        for y_idx in range(len(col_probe)):
-            if col_probe[y_idx] > 150:
-                y_top = by + y_idx
-                break
-
-    # 4. Borde izquierdo (mesa en esquina inferior izquierda si existe):
-    row_top = grises[min(alto_mini - 1, y_top + 20), :]
-    row_bot = grises[max(0, y_bot - 20), :]
-    pts_top = np.where(row_top > 120)[0]
-    pts_bot = np.where(row_bot > 120)[0]
-    x_left = bx
-    if len(pts_bot) > 0 and pts_bot[0] > bx + int(bw * 0.05):
-        if len(pts_top) > 0 and pts_top[0] > bx + int(bw * 0.05):
-            x_left = min(pts_top[0], pts_bot[0])
-        else:
-            x_left = pts_bot[0]
+    for x in range(x_right, x_right - int((x_right - x_left) * 0.2), -1):
+        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.88:
+            x_right = x
+            break
 
     rx1 = max(0, int(x_left / escala))
     ry1 = max(0, int(y_top / escala))
@@ -274,7 +352,7 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     if rx2 - rx1 < 50 or ry2 - ry1 < 50:
         return imagen_bgr, False
 
-    recortada = imagen_bgr[ry1:ry2, rx1:rx2]
+    recortada = imagen_rotada[ry1:ry2, rx1:rx2]
     return recortada, True
 
     return imagen_bgr, False
