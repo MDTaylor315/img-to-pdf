@@ -237,28 +237,36 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         br_x = TR[0] if BR[0] > TR[0] + (50 * escala) else BR[0]
         br_y = BL[1] if BR[0] > TR[0] + (50 * escala) else BR[1]
 
-        x1 = int(max(0, max(TL[0], BL[0])))
-        y1 = int(max(0, max(TL[1], TR[1])))
-        x2 = int(min(ancho_mini, min(TR[0], br_x)))
-        y2 = int(min(alto_mini, min(BL[1], br_y)))
+        if pct_area > 0.94:
+            # En fotos cerradas donde la hoja llena casi toda la pantalla (ej. Hoja 2),
+            # no recortar esquinas exteriores ni aplicar paddings para no amputar notas al margen ("OBSERVACION")
+            x1 = int(max(0, min(TL[0], BL[0])))
+            y1 = int(max(0, min(TL[1], TR[1])))
+            x2 = int(min(ancho_mini, max(TR[0], br_x)))
+            y2 = int(min(alto_mini, max(BL[1], br_y)))
+        else:
+            x1 = int(max(0, max(TL[0], BL[0])))
+            y1 = int(max(0, max(TL[1], TR[1])))
+            x2 = int(min(ancho_mini, min(TR[0], br_x)))
+            y2 = int(min(alto_mini, min(BL[1], br_y)))
 
-        # Refinamiento contra esquinas con escritorio visible o papel secundario desfasado (ej. gd-1, gd-2):
-        # Si la fila o columna exterior contiene fondo/escritorio (0 en clean_paper),
-        # avanzamos el límite hacia el interior hasta delimitar exclusivamente la hoja principal.
-        max_dy = int((y2 - y1) * 0.35)
-        max_dx = int((x2 - x1) * 0.35)
-        y1_lim = y1 + max_dy
-        while y1 < y1_lim and np.mean(clean_paper[y1, x1:x2] == 0) > 0.03:
-            y1 += 1
-        y2_lim = y2 - max_dy
-        while y2 > y2_lim and np.mean(clean_paper[y2 - 1, x1:x2] == 0) > 0.03:
-            y2 -= 1
-        x1_lim = x1 + max_dx
-        while x1 < x1_lim and np.mean(clean_paper[y1:y2, x1] == 0) > 0.03:
-            x1 += 1
-        x2_lim = x2 - max_dx
-        while x2 > x2_lim and np.mean(clean_paper[y1:y2, x2 - 1] == 0) > 0.03:
-            x2 -= 1
+            # Refinamiento contra esquinas con escritorio visible o papel secundario desfasado (ej. gd-1, gd-2):
+            # Si la fila o columna exterior contiene fondo/escritorio (0 en clean_paper),
+            # avanzamos el límite hacia el interior hasta delimitar exclusivamente la hoja principal.
+            max_dy = int((y2 - y1) * 0.35)
+            max_dx = int((x2 - x1) * 0.35)
+            y1_lim = y1 + max_dy
+            while y1 < y1_lim and np.mean(clean_paper[y1, x1:x2] == 0) > 0.03:
+                y1 += 1
+            y2_lim = y2 - max_dy
+            while y2 > y2_lim and np.mean(clean_paper[y2 - 1, x1:x2] == 0) > 0.03:
+                y2 -= 1
+            x1_lim = x1 + max_dx
+            while x1 < x1_lim and np.mean(clean_paper[y1:y2, x1] == 0) > 0.03:
+                x1 += 1
+            x2_lim = x2 - max_dx
+            while x2 > x2_lim and np.mean(clean_paper[y1:y2, x2 - 1] == 0) > 0.03:
+                x2 -= 1
 
         rx1 = int(x1 / escala)
         ry1 = int(y1 / escala)
@@ -266,12 +274,13 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         ry2 = int(y2 / escala)
 
         # Margen de seguridad fino (~1%) para podar rasgados de esquinas o sombras perimetrales
-        pad_x = int(0.012 * (rx2 - rx1))
-        pad_y = int(0.008 * (ry2 - ry1))
-        rx1 = min(ancho_orig, rx1 + pad_x)
-        rx2 = max(0, rx2 - pad_x)
-        ry1 = min(alto_orig, ry1 + pad_y)
-        ry2 = max(0, ry2 - pad_y)
+        if pct_area < 0.94:
+            pad_x = int(0.012 * (rx2 - rx1))
+            pad_y = int(0.008 * (ry2 - ry1))
+            rx1 = min(ancho_orig, rx1 + pad_x)
+            rx2 = max(0, rx2 - pad_x)
+            ry1 = min(alto_orig, ry1 + pad_y)
+            ry2 = max(0, ry2 - pad_y)
 
         if rx2 - rx1 > 100 and ry2 - ry1 > 100:
             return imagen_bgr[ry1:ry2, rx1:rx2], True
@@ -316,31 +325,31 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     mid_y1 = by + int(bh * 0.25)
     mid_y2 = by + int(bh * 0.75)
     cols_in_body = np.mean(clean_rot[mid_y1:mid_y2, :] > 0, axis=0)
-    valid_cols = np.where(cols_in_body > 0.75)[0]
+    valid_cols = np.where(cols_in_body > 0.35)[0]
     if len(valid_cols) == 0:
         return imagen_bgr, False
     x_left = valid_cols[0]
     x_right = valid_cols[-1]
 
     y_top = by
-    for y in range(by, by + int(bh * 0.5)):
-        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.88:
+    for y in range(by, by + int(bh * 0.12)):
+        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.35:
             y_top = y
             break
 
     y_bot = by + bh
-    for y in range(by + bh - 1, by + int(bh * 0.4), -1):
-        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.88:
+    for y in range(by + bh - 1, by + int(bh * 0.88), -1):
+        if np.mean(clean_rot[y, x_left:x_right] > 0) > 0.85:
             y_bot = y
             break
 
-    for x in range(x_left, x_left + int((x_right - x_left) * 0.2)):
-        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.88:
+    for x in range(x_left, x_left + int((x_right - x_left) * 0.12)):
+        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.50:
             x_left = x
             break
 
-    for x in range(x_right, x_right - int((x_right - x_left) * 0.2), -1):
-        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.88:
+    for x in range(x_right, x_right - int((x_right - x_left) * 0.12), -1):
+        if np.mean(clean_rot[y_top:y_bot, x] > 0) > 0.50:
             x_right = x
             break
 
