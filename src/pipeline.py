@@ -170,7 +170,7 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     for c in sorted(cnts_list, key=cv2.contourArea, reverse=True)[:8]:
         area_c = cv2.contourArea(c)
         pct = area_c / float(area_total_mini)
-        if 0.20 <= pct <= 0.88:
+        if 0.20 <= pct <= 0.96:
             hull = cv2.convexHull(c)
             approx = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
             if len(approx) == 4:
@@ -183,9 +183,16 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
                 mask_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))) - mask
                 brillo_ring = cv2.mean(grises, mask=mask_ring)[0]
 
-                # La hoja de papel sobre una mesa o teclado tiene un exterior oscuro (brillo_ring < 125)
+                # La hoja de papel sobre una mesa o teclado tiene un exterior oscuro (brillo_ring < 145)
                 # o una caída notable de luminosidad. Una tabla interna tiene más papel blanco afuera (~180).
-                if (brillo_promedio - brillo_ring >= 25) or (brillo_ring < 125):
+                # Umbrales relajados para fotos del recuadro móvil donde el anillo exterior es delgado.
+                #
+                # GUARDIA ANTI-FLASH: Si el anillo es muy brillante (>200), es otro papel blanco alrededor
+                # (ej. escritorio con varios documentos + flash). En ese caso el warp de perspectiva
+                # confundiría una tabla interna con el borde real. Dejamos que TIER 2 + trim fino se encargue.
+                if brillo_ring > 200:
+                    continue
+                if (brillo_promedio - brillo_ring >= 15) or (brillo_ring < 145):
                     candidatos_quad.append((brillo_promedio, pct, approx))
 
     if candidatos_quad:
@@ -313,12 +320,48 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     c_rot = max(rot_cnts, key=cv2.contourArea)
     bx, by, bw, bh = cv2.boundingRect(c_rot)
 
-    # Si la imagen ya es 100% papel blanco en todos sus márgenes exteriores, no recortar
+    # Evaluar los márgenes exteriores: si son >95% papel, puede ser una foto cerrada del recuadro móvil
     top_p = np.mean(clean_rot[0, :] > 0)
     bot_p = np.mean(clean_rot[-1, :] > 0)
     left_p = np.mean(clean_rot[:, 0] > 0)
     right_p = np.mean(clean_rot[:, -1] > 0)
     if top_p > 0.95 and bot_p > 0.95 and left_p > 0.95 and right_p > 0.95 and pct_area > 0.85:
+        # Trim fino: podar franjas residuales de escritorio/fondo (5-10%) desde cada borde.
+        # Avanzar desde cada borde hacia el interior hasta encontrar una fila/columna que sea >=97% papel.
+        trim_y1 = 0
+        trim_y2 = alto_mini
+        trim_x1 = 0
+        trim_x2 = ancho_mini
+        max_trim_y = int(alto_mini * 0.10)  # máximo 10% por lado
+        max_trim_x = int(ancho_mini * 0.10)
+
+        for y in range(0, max_trim_y):
+            if np.mean(clean_rot[y, :] > 0) >= 0.97:
+                trim_y1 = y
+                break
+        for y in range(alto_mini - 1, alto_mini - 1 - max_trim_y, -1):
+            if np.mean(clean_rot[y, :] > 0) >= 0.97:
+                trim_y2 = y + 1
+                break
+        for x in range(0, max_trim_x):
+            if np.mean(clean_rot[:, x] > 0) >= 0.97:
+                trim_x1 = x
+                break
+        for x in range(ancho_mini - 1, ancho_mini - 1 - max_trim_x, -1):
+            if np.mean(clean_rot[:, x] > 0) >= 0.97:
+                trim_x2 = x + 1
+                break
+
+        # Solo aplicar el trim si realmente hay algo que podar (>1px de cada lado)
+        recorto = (trim_y1 > 1 or trim_y2 < alto_mini - 1 or
+                   trim_x1 > 1 or trim_x2 < ancho_mini - 1)
+        if recorto:
+            rx1 = max(0, int(trim_x1 / escala))
+            ry1 = max(0, int(trim_y1 / escala))
+            rx2 = min(ancho_orig, int(trim_x2 / escala))
+            ry2 = min(alto_orig, int(trim_y2 / escala))
+            if rx2 - rx1 > 100 and ry2 - ry1 > 100:
+                return imagen_rotada[ry1:ry2, rx1:rx2], True
         return imagen_bgr, False
 
     # Delimitar límites donde el cuerpo del papel es continuo (sin escritorio)
