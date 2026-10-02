@@ -8,6 +8,12 @@ from PIL import Image, ImageOps
 
 import importlib
 
+# Detector de esquinas via Deep Learning (ONNX) — Tier 0
+try:
+    from . import doc_detector as _doc_detector
+except (ImportError, ValueError):
+    import doc_detector as _doc_detector
+
 # Intentar cargar pytesseract opcionalmente vía importlib para evitar advertencias de linter estático
 try:
     pytesseract = importlib.import_module("pytesseract")
@@ -102,21 +108,23 @@ def ordenar_cuatro_puntos(pts):
 
 def aplicar_perspectiva_cuatro_puntos(imagen_bgr, pts):
     """
-    Aplica transformación de perspectiva para desdoblar la hoja y estirarla
-    de esquina a esquina a un rectángulo perfecto, eliminando fondos diagonales.
+    Aplica transformacion de perspectiva para desdoblar la hoja y estirarla
+    de esquina a esquina a un rectangulo perfecto, eliminando fondos diagonales.
     """
     rect = ordenar_cuatro_puntos(pts)
     (tl, tr, br, bl) = rect
 
-    # Calcular ancho proyectado
+    # Calcular ancho proyectado como promedio de los dos lados horizontales.
+    # Usar el promedio en lugar del maximo da un aspect ratio mas estable cuando
+    # las esquinas tienen pequenas imprecisiones (p.ej. detector DL con heatmap 128px).
     ancho_a = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
     ancho_b = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    max_ancho = max(int(ancho_a), int(ancho_b))
+    max_ancho = int((ancho_a + ancho_b) / 2)
 
-    # Calcular alto proyectado
+    # Calcular alto proyectado como promedio de los dos lados verticales
     alto_a = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
     alto_b = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    max_alto = max(int(alto_a), int(alto_b))
+    max_alto = int((alto_a + alto_b) / 2)
 
     if max_ancho < 50 or max_alto < 50:
         return imagen_bgr, False
@@ -132,17 +140,84 @@ def aplicar_perspectiva_cuatro_puntos(imagen_bgr, pts):
     desdoblada = cv2.warpPerspective(imagen_bgr, matriz, (max_ancho, max_alto), flags=cv2.INTER_LINEAR)
     return desdoblada, True
 
+def recortar_bordes_residuales(desdoblada_bgr, max_pct=0.035, umbral_grad=15.0):
+    """
+    Detecta y poda finas franjas residuales de fondo oscuro (mesa, escritorio)
+    en el perímetro del documento desdoblado (máximo max_pct, ej. 3.5%).
+    Solo recorta si el borde exterior es efectivamente fondo no-papel (< 130).
+    """
+    h, w = desdoblada_bgr.shape[:2]
+    gray = cv2.cvtColor(desdoblada_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 1. Borde inferior
+    max_trim_b = int(h * max_pct)
+    cut_b = 0
+    if h > 100 and max_trim_b > 2:
+        outer_b = gray[h-3:h, int(0.10 * w):int(0.90 * w)].mean()
+        if outer_b < 130:
+            dy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+            bot_strip = dy[h - max_trim_b:h, int(0.10 * w):int(0.90 * w)].mean(axis=1)
+            peaks = np.where(bot_strip > umbral_grad)[0]
+            if len(peaks) > 0:
+                cut_b = max_trim_b - peaks[0] + 1
+
+    # 2. Borde superior
+    max_trim_t = int(h * max_pct)
+    cut_t = 0
+    if h > 100 and max_trim_t > 2:
+        outer_t = gray[:3, int(0.10 * w):int(0.90 * w)].mean()
+        if outer_t < 130:
+            dy = np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3))
+            top_strip = dy[:max_trim_t, int(0.10 * w):int(0.90 * w)].mean(axis=1)
+            peaks = np.where(top_strip > umbral_grad)[0]
+            if len(peaks) > 0:
+                cut_t = peaks[-1] + 1
+
+    # 3. Borde izquierdo
+    max_trim_l = int(w * max_pct)
+    cut_l = 0
+    if w > 100 and max_trim_l > 2:
+        outer_l = gray[int(0.10 * h):int(0.90 * h), :3].mean()
+        if outer_l < 130:
+            dx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+            left_strip = dx[int(0.10 * h):int(0.90 * h), :max_trim_l].mean(axis=0)
+            peaks = np.where(left_strip > umbral_grad)[0]
+            if len(peaks) > 0:
+                cut_l = peaks[-1] + 1
+
+    # 4. Borde derecho
+    max_trim_r = int(w * max_pct)
+    cut_r = 0
+    if w > 100 and max_trim_r > 2:
+        outer_r = gray[int(0.10 * h):int(0.90 * h), w-3:w].mean()
+        if outer_r < 130:
+            dx = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+            right_strip = dx[int(0.10 * h):int(0.90 * h), w - max_trim_r:w].mean(axis=0)
+            peaks = np.where(right_strip > umbral_grad)[0]
+            if len(peaks) > 0:
+                cut_r = max_trim_r - peaks[0] + 1
+
+    y1 = cut_t
+    y2 = h - cut_b if cut_b > 0 else h
+    x1 = cut_l
+    x2 = w - cut_r if cut_r > 0 else w
+
+    if (x2 - x1) > 100 and (y2 - y1) > 100:
+        return desdoblada_bgr[y1:y2, x1:x2]
+    return desdoblada_bgr
+
+
 def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MINIATURA_ANALISIS):
     """
-    Detección de bordes y perspectiva de la hoja de papel.
-    Prioridad: 
-    1. Si detecta las 4 esquinas de la hoja (incluso en ángulo o sobre laptops),
-       aplica transformación de perspectiva para que las esquinas del archivo coincidan
-       estrictamente con las esquinas físicas de la hoja (sin teclado ni fondo).
+    Detección de bordes y perspectiva de la hoja de papel con control inteligente.
+    Prioridad:
+    0. Deep Learning (ONNX): YOLO localiza el documento + LCNet regresa las 4 esquinas exactas.
+       Se aplica validación de cobertura frente a la silueta de papel para no amputar hojas dobladas/arrugadas.
+    1. Canny + RETR_LIST para aislar el papel blanco de laptops o fondos oscuros/claros.
     2. Respaldo conservador si la toma está en plano cerrado o tiene adjuntos.
     """
     alto_orig, ancho_orig = imagen_bgr.shape[:2]
-    
+
     escala = max_dim_analisis / float(max(alto_orig, ancho_orig))
     if escala < 1.0:
         ancho_mini = int(ancho_orig * escala)
@@ -156,8 +231,35 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     area_total_mini = ancho_mini * alto_mini
     grises = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
 
-    # --- TIER 1: DETECCIÓN DE 4 ESQUINAS DE PAPEL Y CORRECCIÓN DE PERSPECTIVA ---
-    # Usar Canny + RETR_LIST para aislar el papel blanco de laptops o fondos oscuros/claros
+    # Estimación rápida de cobertura de papel global
+    _, thresh_pre = cv2.threshold(grises, 125, 255, cv2.THRESH_BINARY)
+    k_pre = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+    clean_pre = cv2.morphologyEx(thresh_pre, cv2.MORPH_CLOSE, k_pre)
+    cnts_pre, _ = cv2.findContours(clean_pre, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    area_max_pre = cv2.contourArea(max(cnts_pre, key=cv2.contourArea)) if cnts_pre else 0
+    pct_papel_global = area_max_pre / float(area_total_mini)
+
+    # --- TIER 0: DETECCIÓN DE 4 ESQUINAS VIA DEEP LEARNING (ONNX) ---
+    if getattr(config, "USAR_DETECTOR_DL", True):
+        esquinas_dl = _doc_detector.detectar_esquinas_documento(imagen_bgr)
+        if esquinas_dl is not None:
+            area_dl = cv2.contourArea(esquinas_dl) / float(ancho_orig * alto_orig)
+            # Guardia de Cobertura: si OpenCV ve que la hoja cubre >= 55% de la foto pero DL
+            # sólo detectó una fracción (< 55% o < 65% de la silueta real, ej. manual arrugado en Pag 1 y Pag 3),
+            # descartamos DL para no cortar la página a la mitad y dejamos que OpenCV capture el documento completo.
+            usar_dl = True
+            if pct_papel_global >= 0.55 and area_dl < 0.50:
+                usar_dl = False
+            elif pct_papel_global >= 0.65 and area_dl < (pct_papel_global * 0.60):
+                usar_dl = False
+
+            if usar_dl:
+                desdoblada, ok = aplicar_perspectiva_cuatro_puntos(imagen_bgr, esquinas_dl)
+                if ok:
+                    desdoblada = recortar_bordes_residuales(desdoblada)
+                    return desdoblada, True
+
+    # --- TIER 1: DETECCION DE 4 ESQUINAS DE PAPEL Y CORRECCION DE PERSPECTIVA ---
     blur = cv2.GaussianBlur(grises, (5, 5), 0)
     canny = cv2.Canny(blur, 40, 150)
     k_canny = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -166,11 +268,15 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     cnts_list, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     candidatos_quad = []
 
-    # Evaluar solo los contornos principales ordenados por área para máxima velocidad
     for c in sorted(cnts_list, key=cv2.contourArea, reverse=True)[:8]:
         area_c = cv2.contourArea(c)
         pct = area_c / float(area_total_mini)
         if 0.20 <= pct <= 0.96:
+            # Si la foto es un plano cerrado donde el papel llena casi todo (pct_papel_global > 0.88),
+            # no aceptar cuadriláteros que cubran menos del 80% (son tablas internas, ej. Pag 2)
+            if pct_papel_global > 0.88 and pct < 0.80:
+                continue
+
             hull = cv2.convexHull(c)
             approx = cv2.approxPolyDP(hull, 0.025 * cv2.arcLength(hull, True), True)
             if len(approx) == 4:
@@ -178,31 +284,22 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
                 cv2.drawContours(mask, [approx], -1, 255, -1)
                 brillo_promedio = cv2.mean(grises, mask=mask)[0]
 
-                # Comprobar el anillo exterior al cuadrilátero para distinguir
-                # el borde real de la hoja vs una tabla interna impresa en papel blanco
                 mask_ring = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))) - mask
                 brillo_ring = cv2.mean(grises, mask=mask_ring)[0]
 
-                # La hoja de papel sobre una mesa o teclado tiene un exterior oscuro (brillo_ring < 145)
-                # o una caída notable de luminosidad. Una tabla interna tiene más papel blanco afuera (~180).
-                # Umbrales relajados para fotos del recuadro móvil donde el anillo exterior es delgado.
-                #
-                # GUARDIA ANTI-FLASH: Si el anillo es muy brillante (>200), es otro papel blanco alrededor
-                # (ej. escritorio con varios documentos + flash). En ese caso el warp de perspectiva
-                # confundiría una tabla interna con el borde real. Dejamos que TIER 2 + trim fino se encargue.
                 if brillo_ring > 200:
                     continue
                 if (brillo_promedio - brillo_ring >= 15) or (brillo_ring < 145):
                     candidatos_quad.append((brillo_promedio, pct, approx))
 
     if candidatos_quad:
-        # La hoja de papel es siempre el cuadrilátero con mayor reflectancia/brillo blanco
         candidatos_quad.sort(key=lambda item: item[0], reverse=True)
         mejor_quad = candidatos_quad[0]
         pts_orig = (mejor_quad[2].reshape(-1, 2) / escala).astype(np.float32)
         desdoblada, ok = aplicar_perspectiva_cuatro_puntos(imagen_bgr, pts_orig)
         if ok:
             return desdoblada, True
+
 
     # --- TIER 2: DELIMITACIÓN DE HOJA Y ELIMINACIÓN DE FONDO/ESCRITORIO ---
     _, thresh_paper = cv2.threshold(grises, 125, 255, cv2.THRESH_BINARY)
@@ -257,22 +354,22 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
             x2 = int(min(ancho_mini, min(TR[0], br_x)))
             y2 = int(min(alto_mini, min(BL[1], br_y)))
 
-            # Refinamiento contra esquinas con escritorio visible o papel secundario desfasado (ej. gd-1, gd-2):
+            # Refinamiento contra esquinas con escritorio visible o papel secundario desfasado:
             # Si la fila o columna exterior contiene fondo/escritorio (0 en clean_paper),
             # avanzamos el límite hacia el interior hasta delimitar exclusivamente la hoja principal.
-            max_dy = int((y2 - y1) * 0.35)
-            max_dx = int((x2 - x1) * 0.35)
+            max_dy = int((y2 - y1) * 0.25)
+            max_dx = int((x2 - x1) * 0.25)
             y1_lim = y1 + max_dy
-            while y1 < y1_lim and np.mean(clean_paper[y1, x1:x2] == 0) > 0.03:
+            while y1 < y1_lim and np.mean(clean_paper[y1, x1:x2] == 0) > 0.15:
                 y1 += 1
             y2_lim = y2 - max_dy
-            while y2 > y2_lim and np.mean(clean_paper[y2 - 1, x1:x2] == 0) > 0.03:
+            while y2 > y2_lim and np.mean(clean_paper[y2 - 1, x1:x2] == 0) > 0.15:
                 y2 -= 1
             x1_lim = x1 + max_dx
-            while x1 < x1_lim and np.mean(clean_paper[y1:y2, x1] == 0) > 0.03:
+            while x1 < x1_lim and np.mean(clean_paper[y1:y2, x1] == 0) > 0.15:
                 x1 += 1
             x2_lim = x2 - max_dx
-            while x2 > x2_lim and np.mean(clean_paper[y1:y2, x2 - 1] == 0) > 0.03:
+            while x2 > x2_lim and np.mean(clean_paper[y1:y2, x2 - 1] == 0) > 0.15:
                 x2 -= 1
 
         rx1 = int(x1 / escala)
@@ -280,10 +377,10 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         rx2 = int(x2 / escala)
         ry2 = int(y2 / escala)
 
-        # Margen de seguridad fino (~1%) para podar rasgados de esquinas o sombras perimetrales
+        # Margen de seguridad mínimo (~0.4%) para podar rasgados de esquinas sin amputar sellos
         if pct_area < 0.94:
-            pad_x = int(0.012 * (rx2 - rx1))
-            pad_y = int(0.008 * (ry2 - ry1))
+            pad_x = int(0.004 * (rx2 - rx1))
+            pad_y = int(0.003 * (ry2 - ry1))
             rx1 = min(ancho_orig, rx1 + pad_x)
             rx2 = max(0, rx2 - pad_x)
             ry1 = min(alto_orig, ry1 + pad_y)
@@ -326,13 +423,11 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     left_p = np.mean(clean_rot[:, 0] > 0)
     right_p = np.mean(clean_rot[:, -1] > 0)
     if top_p > 0.95 and bot_p > 0.95 and left_p > 0.95 and right_p > 0.95 and pct_area > 0.85:
-        # Trim fino: podar franjas residuales de escritorio/fondo (5-10%) desde cada borde.
-        # Avanzar desde cada borde hacia el interior hasta encontrar una fila/columna que sea >=97% papel.
         trim_y1 = 0
         trim_y2 = alto_mini
         trim_x1 = 0
         trim_x2 = ancho_mini
-        max_trim_y = int(alto_mini * 0.10)  # máximo 10% por lado
+        max_trim_y = int(alto_mini * 0.10)
         max_trim_x = int(ancho_mini * 0.10)
 
         for y in range(0, max_trim_y):
@@ -352,7 +447,6 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
                 trim_x2 = x + 1
                 break
 
-        # Solo aplicar el trim si realmente hay algo que podar (>1px de cada lado)
         recorto = (trim_y1 > 1 or trim_y2 < alto_mini - 1 or
                    trim_x1 > 1 or trim_x2 < ancho_mini - 1)
         if recorto:
@@ -407,7 +501,6 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     recortada = imagen_rotada[ry1:ry2, rx1:rx2]
     return recortada, True
 
-    return imagen_bgr, False
 
 _RED_ORIENTACION_ONNX = None
 _ERROR_CARGA_MODELO_ONNX = False
@@ -475,7 +568,6 @@ def detectar_y_corregir_orientacion_texto(imagen_bgr, max_dim_analisis=config.MA
     Detecta y corrige la orientación del documento (0°, 90°, 180°, 270°)
     para dejar el texto derecho y alineado a la lectura natural de la página.
     """
-    # 1. Prioridad: Clasificador ONNX ultraligero (~7ms con cv2.dnn)
     angulo_onnx = clasificar_angulo_orientacion_onnx(imagen_bgr)
     if angulo_onnx is not None:
         if angulo_onnx == 90:
@@ -486,7 +578,6 @@ def detectar_y_corregir_orientacion_texto(imagen_bgr, max_dim_analisis=config.MA
             return cv2.rotate(imagen_bgr, cv2.ROTATE_90_CLOCKWISE), True
         return imagen_bgr, False
 
-    # 2. Respaldo secundario: Tesseract OSD si está disponible
     if HAS_PYTESSERACT and pytesseract is not None:
         try:
             img_rgb = cv2.cvtColor(imagen_bgr, cv2.COLOR_BGR2RGB)
@@ -502,7 +593,6 @@ def detectar_y_corregir_orientacion_texto(imagen_bgr, max_dim_analisis=config.MA
         except Exception:
             pass
 
-    # 3. Respaldo terciario: Heurística geométrica de 90° (para fotos tomadas de lado)
     alto, ancho = imagen_bgr.shape[:2]
     max_dim = max(alto, ancho)
 
@@ -524,6 +614,63 @@ def detectar_y_corregir_orientacion_texto(imagen_bgr, max_dim_analisis=config.MA
     proj_v = np.var(np.sum(thresh, axis=0))
     if ancho > alto and proj_v > 1.3 * proj_h:
         return cv2.rotate(imagen_bgr, cv2.ROTATE_90_CLOCKWISE), True
+
+    return imagen_bgr, False
+
+
+def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=1.5):
+    """
+    Detecta y corrige cualquier inclinación residual leve (0.25° a 1.5°)
+    en las líneas de texto del documento (subpixel deskew).
+    Realiza recorte inscrito automático para eliminar cualquier triángulo blanco en bordes.
+    """
+    h, w = imagen_bgr.shape[:2]
+    escala = 1000.0 / float(max(h, w))
+    mini = cv2.resize(imagen_bgr, (int(w * escala), int(h * escala)), interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
+
+    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(30 * escala) | 1, 3))
+    dilated = cv2.dilate(thresh, kernel, iterations=1)
+
+    lines = cv2.HoughLinesP(
+        dilated, 1, np.pi / 1800, threshold=80,
+        minLineLength=int(100 * escala), maxLineGap=int(15 * escala)
+    )
+    if lines is None or len(lines) < 10:
+        return imagen_bgr, False
+
+    angles = []
+    for l in lines:
+        x1, y1, x2, y2 = l.flatten()
+        dx = x2 - x1
+        dy = y2 - y1
+        if abs(dx) > int(80 * escala):
+            angle = float(np.degrees(np.arctan2(dy, dx)))
+            if abs(angle) <= max_angulo:
+                angles.append(angle)
+
+    if len(angles) < 10:
+        return imagen_bgr, False
+
+    median_angle = float(np.median(angles))
+
+    if abs(median_angle) >= 0.25:
+        centro = (w / 2.0, h / 2.0)
+        M = cv2.getRotationMatrix2D(centro, median_angle, 1.0)
+        rotada = cv2.warpAffine(
+            imagen_bgr, M, (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE
+        )
+        # Recorte inscrito para garantizar cero fondo vacío
+        rad = np.radians(abs(median_angle))
+        sin_a = np.sin(rad)
+        pad_w = int(np.ceil(0.5 * h * sin_a))
+        pad_h = int(np.ceil(0.5 * w * sin_a))
+        if pad_w > 0 or pad_h > 0:
+            rotada = rotada[pad_h:h-pad_h, pad_w:w-pad_w]
+        return rotada, True
 
     return imagen_bgr, False
 
@@ -583,6 +730,8 @@ def procesar_imagen_a_bytes(
     # 2. AUTO-ORIENTAR SEGUNDO (Ajustar si las líneas de texto están boca abajo o de lado)
     if auto_orientar:
         img_bgr, _ = detectar_y_corregir_orientacion_texto(img_bgr)
+        # Enderezado fino de líneas de texto (subpixel deskew: 0.25° a 7.0°)
+        img_bgr, _ = corregir_inclinacion_fina_texto(img_bgr)
 
     img_bgr = redimensionar_si_es_necesario(img_bgr, max_dim=config.MAX_DIM_IMAGEN)
 
