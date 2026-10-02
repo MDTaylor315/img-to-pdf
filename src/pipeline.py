@@ -210,6 +210,112 @@ def recortar_bordes_residuales(desdoblada_bgr, max_pct=0.035, umbral_grad=15.0):
     return desdoblada_bgr
 
 
+def aislar_hoja_documento(img_bgr):
+    """
+    Aísla la hoja principal del documento eliminando cartulinas de soporte (MONTANO FEST),
+    portapapeles inferiores, franjas laterales residuales y hojas secundarias en el fondo.
+    Se ejecuta tras la orientación y deskew del texto, cuando el documento ya está ortogonalmente alineado.
+    """
+    h, w = img_bgr.shape[:2]
+    if h < 200 or w < 200:
+        return img_bgr
+
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+
+    # 1. Borde inferior: escanear mitad inferior en la zona central [20%..80%]
+    # El margen inferior de la hoja principal es el último segmento continuo de papel blanco limpio
+    y_start_bot = int(h * 0.50)
+    med_x1, med_x2 = int(0.20 * w), int(0.80 * w)
+    blancos_bot = []
+    for y in range(y_start_bot, h):
+        fg = gray[y, med_x1:med_x2]
+        fs = sat[y, med_x1:med_x2]
+        if fg.mean() > 135 and fs.mean() <= 35 and fg.std() < 12.0 and np.percentile(fg, 5) > 95:
+            blancos_bot.append(y)
+
+    y_bot = h
+    if blancos_bot:
+        segs = []
+        cur = [blancos_bot[0]]
+        for y in blancos_bot[1:]:
+            if y == cur[-1] + 1:
+                cur.append(y)
+            else:
+                segs.append(cur)
+                cur = [y]
+        segs.append(cur)
+        largos = [s for s in segs if len(s) >= 40]
+        if largos:
+            ultimo = largos[-1]
+            if ultimo[-1] < h - 10:
+                y_bot = ultimo[-1]
+
+    # 2. Bordes laterales: escanear columnas desde los extremos hacia adentro deteniéndose en papel blanco
+    x_left = 0
+    max_scan_x = int(w * 0.25)
+    for x in range(max_scan_x):
+        cg = gray[int(0.15 * h):int(0.85 * h), x]
+        cs = sat[int(0.15 * h):int(0.85 * h), x]
+        if cg.mean() >= 135 and cs.mean() <= 35 and np.percentile(cg, 5) >= 60:
+            x_left = x
+            break
+
+    x_right = w
+    for x in range(w - 1, w - 1 - max_scan_x, -1):
+        cg = gray[int(0.15 * h):int(0.85 * h), x]
+        cs = sat[int(0.15 * h):int(0.85 * h), x]
+        if cg.mean() >= 135 and cs.mean() <= 35 and np.percentile(cg, 5) >= 60:
+            x_right = x + 1
+            break
+
+    w_hoja = max(100, x_right - x_left)
+
+    # 3. Borde superior: detectar márgenes limpios y separar hojas traseras de pedidos
+    y_top_limit = int(h * 0.30)
+    blancos_top = []
+    for y in range(y_top_limit):
+        fg = gray[y, med_x1:med_x2]
+        fs = sat[y, med_x1:med_x2]
+        if fg.mean() > 135 and fs.mean() <= 35 and fg.std() < 12.0 and np.percentile(fg, 5) > 95:
+            blancos_top.append(y)
+
+    y_top = 0
+    if blancos_top:
+        segs = []
+        cur = [blancos_top[0]]
+        for y in blancos_top[1:]:
+            if y == cur[-1] + 1:
+                cur.append(y)
+            else:
+                segs.append(cur)
+                cur = [y]
+        segs.append(cur)
+        gaps = [s for s in segs if len(s) >= 15]
+        if gaps:
+            primer_gap = gaps[0]
+            ar_inicial = (y_bot - primer_gap[0]) / float(w_hoja)
+            if ar_inicial > 1.46:
+                mejor_g = primer_gap
+                min_diff = abs(ar_inicial - 1.38)
+                for g in gaps[1:]:
+                    ar = (y_bot - g[0]) / float(w_hoja)
+                    if 1.15 <= ar <= 1.46:
+                        diff = abs(ar - 1.38)
+                        if diff < min_diff:
+                            min_diff = diff
+                            mejor_g = g
+                y_top = mejor_g[0]
+            else:
+                y_top = primer_gap[0]
+
+    # Validar que las dimensiones resultantes sean coherentes (> 50% de la imagen)
+    if (x_right - x_left) > 0.50 * w and (y_bot - y_top) > 0.50 * h:
+        return img_bgr[y_top:y_bot, x_left:x_right]
+    return img_bgr
+
+
 def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MINIATURA_ANALISIS):
     """
     Detección de bordes y perspectiva de la hoja de papel con control inteligente.
@@ -616,10 +722,10 @@ def detectar_y_corregir_orientacion_texto(imagen_bgr, max_dim_analisis=config.MA
     return imagen_bgr, False
 
 
-def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=1.5):
+def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=12.0):
     """
-    Detecta y corrige cualquier inclinación residual leve (0.25° a 1.5°)
-    en las líneas de texto del documento (subpixel deskew).
+    Detecta y corrige cualquier inclinación residual o angular (0.15° a 12.0°)
+    en las líneas de texto y tablas del documento (subpixel deskew).
     Realiza recorte inscrito automático para eliminar cualquier triángulo blanco en bordes.
     """
     h, w = imagen_bgr.shape[:2]
@@ -627,15 +733,17 @@ def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=1.5):
     mini = cv2.resize(imagen_bgr, (int(w * escala), int(h * escala)), interpolation=cv2.INTER_AREA)
     gray = cv2.cvtColor(mini, cv2.COLOR_BGR2GRAY)
 
-    _, thresh = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY_INV)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (int(30 * escala) | 1, 3))
-    dilated = cv2.dilate(thresh, kernel, iterations=1)
+    k_h = cv2.getStructuringElement(cv2.MORPH_RECT, (int(25 * escala) | 1, 1))
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    abs_grad = cv2.convertScaleAbs(grad_y)
+    _, thresh = cv2.threshold(abs_grad, 40, 255, cv2.THRESH_BINARY)
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, k_h)
 
     lines = cv2.HoughLinesP(
-        dilated, 1, np.pi / 1800, threshold=80,
-        minLineLength=int(100 * escala), maxLineGap=int(15 * escala)
+        morph, 1, np.pi / 180, 60,
+        minLineLength=int(40 * escala), maxLineGap=int(10 * escala)
     )
-    if lines is None or len(lines) < 10:
+    if lines is None:
         return imagen_bgr, False
 
     angles = []
@@ -643,17 +751,20 @@ def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=1.5):
         x1, y1, x2, y2 = l.flatten()
         dx = x2 - x1
         dy = y2 - y1
-        if abs(dx) > int(80 * escala):
-            angle = float(np.degrees(np.arctan2(dy, dx)))
-            if abs(angle) <= max_angulo:
-                angles.append(angle)
+        ang = np.degrees(np.arctan2(dy, dx))
+        while ang > 45:
+            ang -= 90
+        while ang < -45:
+            ang += 90
+        if abs(ang) <= max_angulo:
+            angles.append(ang)
 
-    if len(angles) < 10:
+    if len(angles) < 8:
         return imagen_bgr, False
 
     median_angle = float(np.median(angles))
 
-    if abs(median_angle) >= 0.25:
+    if abs(median_angle) >= 0.15:
         centro = (w / 2.0, h / 2.0)
         M = cv2.getRotationMatrix2D(centro, median_angle, 1.0)
         rotada = cv2.warpAffine(
@@ -661,13 +772,10 @@ def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=1.5):
             flags=cv2.INTER_CUBIC,
             borderMode=cv2.BORDER_REPLICATE
         )
-        # Recorte inscrito para garantizar cero fondo vacío
-        rad = np.radians(abs(median_angle))
-        sin_a = np.sin(rad)
-        pad_w = int(np.ceil(0.5 * h * sin_a))
-        pad_h = int(np.ceil(0.5 * w * sin_a))
-        if pad_w > 0 or pad_h > 0:
-            rotada = rotada[pad_h:h-pad_h, pad_w:w-pad_w]
+        # Recorte de seguridad mínimo (1 a 3 px) para limpiar rebabas de interpolación sin amputar texto
+        pad = min(3, max(1, int(round(abs(median_angle) * 0.4))))
+        if pad > 0:
+            rotada = rotada[pad:h-pad, pad:w-pad]
         return rotada, True
 
     return imagen_bgr, False
@@ -730,6 +838,14 @@ def procesar_imagen_a_bytes(
         img_bgr, _ = detectar_y_corregir_orientacion_texto(img_bgr)
         # Enderezado fino de líneas de texto (subpixel deskew: 0.25° a 7.0°)
         img_bgr, _ = corregir_inclinacion_fina_texto(img_bgr)
+
+    # 3. AISLAMIENTO FINO DE LA HOJA PRINCIPAL
+    # Desecha cartulinas de soporte, portapapeles y hojas traseras de pedidos
+    if auto_crop:
+        img_bgr = aislar_hoja_documento(img_bgr)
+        # Re-alineación fina de ultra-precisión sobre la hoja aislada (sin interferencia de fondos secundarios)
+        if auto_orientar:
+            img_bgr, _ = corregir_inclinacion_fina_texto(img_bgr)
 
     img_bgr = redimensionar_si_es_necesario(img_bgr, max_dim=config.MAX_DIM_IMAGEN)
 

@@ -101,7 +101,7 @@ def _bgr_a_tensor(imagen_bgr, tamano):
 # Etapa 1: YOLO — detectar bounding-boxes candidatos del documento
 # ---------------------------------------------------------------------------
 _YOLO_INPUT_SIZE  = 960    # Shape del modelo: [1, 3, 960, 960]
-_YOLO_CONF_UMBRAL = 0.20   # Confianza minima para aceptar una deteccion candidata
+_YOLO_CONF_UMBRAL = 0.08   # Confianza minima para aceptar una deteccion candidata
 
 
 def _inferir_bboxes_candidatos_yolo(imagen_bgr, conf_umbral=_YOLO_CONF_UMBRAL):
@@ -287,6 +287,18 @@ def _validar_cuadrilatero(pts_norm, ancho, alto):
     if ratio > 2.5:
         return False
 
+    # Filtro anti-distorsión: los lados opuestos de una hoja de papel deben ser casi paralelos
+    diff_w = abs(w_top - w_bot) / max(w_top, w_bot)
+    diff_h = abs(h_left - h_right) / max(h_left, h_right)
+    if diff_w > 0.18 or diff_h > 0.18:
+        return False
+
+    # Divergencia angular entre bordes horizontales (top vs bottom)
+    ang_t = np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0]))
+    ang_b = np.degrees(np.arctan2(br[1] - bl[1], br[0] - bl[0]))
+    if abs(ang_t - ang_b) > 7.5:
+        return False
+
     return True
 
 
@@ -302,7 +314,9 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
     H, W = imagen_bgr.shape[:2]
     candidatos = _inferir_bboxes_candidatos_yolo(imagen_bgr)
     if not candidatos:
-        return None
+        candidatos = []
+    # Evaluar siempre la imagen completa para que LCNet pueda inferir esquinas directas
+    candidatos.append((0.50, 0, 0, W, H))
 
     mejores_opciones = []
 
@@ -361,6 +375,14 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
             # Medir regularidad geométrica del cuadrilátero (paralelismo)
             diff_w = abs(w_top - w_bot) / max(w_top, w_bot)
             diff_h = abs(h_left - h_right) / max(h_left, h_right)
+            if diff_w > 0.18 or diff_h > 0.18:
+                continue
+
+            ang_t = np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0]))
+            ang_b = np.degrees(np.arctan2(br[1] - bl[1], br[0] - bl[0]))
+            if abs(ang_t - ang_b) > 7.5:
+                continue
+
             regularidad = max(0.0, 1.0 - (diff_w + diff_h) / 2.0)
 
             score = 2.5 + (c_yolo * 0.8) + (regularidad * 1.5)
@@ -387,6 +409,28 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
                 "ar": ar,
                 "area_pct": area_pct
             })
+
+        # Candidato ortogonal directo de YOLO:
+        # Si YOLO detecta una caja con buen aspect ratio de documento vertical
+        if c_yolo >= 0.12:
+            box_ar = float(bh) / float(bw)
+            box_area_pct = float(bw * bh) / float(W * H)
+            if 1.15 <= box_ar <= 1.55 and box_area_pct >= 0.25:
+                pts_bbox = np.array([
+                    [x1, y1],
+                    [x2, y1],
+                    [x2, y2],
+                    [x1, y2]
+                ], dtype=np.float32)
+                box_score = 3.0 + (c_yolo * 1.5)
+                if 1.30 <= box_ar <= 1.48:
+                    box_score += 1.0
+                mejores_opciones.append({
+                    "esquinas_px": pts_bbox,
+                    "score": box_score,
+                    "ar": box_ar,
+                    "area_pct": box_area_pct
+                })
 
     if not mejores_opciones:
         return None
