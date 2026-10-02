@@ -15,6 +15,7 @@ Si devuelve None, el pipeline recae en la logica OpenCV de respaldo (Tiers 1 y 2
 """
 
 import os
+import cv2
 import numpy as np
 
 from . import config
@@ -96,48 +97,68 @@ def _bgr_a_tensor(imagen_bgr, tamano):
     resized = cv2.resize(imagen_bgr, (tamano, tamano), interpolation=cv2.INTER_LINEAR)
     rgb     = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     norma   = (rgb - _MEAN) / _STD
-    return np.ascontiguousarray(norma.transpose(2, 0, 1)[np.newaxis])   # [1,3,H,W]
-
-
-# ---------------------------------------------------------------------------
-# Etapa 1: YOLO — detectar bounding-box del documento
+    return np.ascontiguousarray(norma.transpose(2, 0, 1)[np.newaxis])   # [1,3,H,W# ---------------------------------------------------------------------------
+# Etapa 1: YOLO — detectar bounding-boxes candidatos del documento
 # ---------------------------------------------------------------------------
 _YOLO_INPUT_SIZE  = 960    # Shape del modelo: [1, 3, 960, 960]
-_YOLO_CONF_UMBRAL = 0.40   # Confianza minima para aceptar una deteccion
+_YOLO_CONF_UMBRAL = 0.20   # Confianza minima para aceptar una deteccion candidata
+
+
+def _inferir_bboxes_candidatos_yolo(imagen_bgr, conf_umbral=_YOLO_CONF_UMBRAL):
+    """
+    Ejecuta el modelo YOLO y retorna una lista de bboxes candidatos [x1, y1, x2, y2]
+    en pixeles absolutos, ordenados por confianza descendente.
+    """
+    H, W = imagen_bgr.shape[:2]
+    tensor = _bgr_a_tensor(imagen_bgr, _YOLO_INPUT_SIZE)
+    salida = _sess_yolo.run(None, {"images": tensor})[0][0]  # [5, 18900]
+
+    conf = salida[4]
+    indices = np.where(conf > conf_umbral)[0]
+    if len(indices) == 0:
+        return []
+
+    s = float(_YOLO_INPUT_SIZE)
+    boxes_raw = []
+    for idx in indices:
+        c = float(conf[idx])
+        cx, cy, bw, bh = salida[0, idx], salida[1, idx], salida[2, idx], salida[3, idx]
+        x1 = float(np.clip((cx - bw / 2) / s, 0.0, 1.0))
+        y1 = float(np.clip((cy - bh / 2) / s, 0.0, 1.0))
+        x2 = float(np.clip((cx + bw / 2) / s, 0.0, 1.0))
+        y2 = float(np.clip((cy + bh / 2) / s, 0.0, 1.0))
+        boxes_raw.append((c, int(x1 * W), int(y1 * H), int(x2 * W), int(y2 * H)))
+
+    # Ordenar por confianza y quedarse con las mejores cajas diversas
+    boxes_raw.sort(key=lambda b: b[0], reverse=True)
+    cajas_evaluar = []
+    for b in boxes_raw:
+        c, x1, y1, x2, y2 = b
+        duplicada = False
+        for cb in cajas_evaluar:
+            _, cx1, cy1, cx2, cy2 = cb
+            if abs(x1 - cx1) < 40 and abs(y1 - cy1) < 40 and abs(x2 - cx2) < 40 and abs(y2 - cy2) < 40:
+                duplicada = True
+                break
+        if not duplicada:
+            cajas_evaluar.append(b)
+        if len(cajas_evaluar) >= 5:
+            break
+
+    return cajas_evaluar
 
 
 def _inferir_bbox_yolo(imagen_bgr):
     """
-    Ejecuta el modelo YOLO y retorna el bounding-box [x1, y1, x2, y2] del
-    documento con mayor confianza en coordenadas normalizadas [0..1].
-    Retorna None si ninguna deteccion supera el umbral de confianza.
-
-    Formato de salida del modelo: [1, 5, 18900]
-    Canal 0: cx, 1: cy, 2: w, 3: h, 4: conf (todas normalizadas 0-1)
+    Retorna el mejor bounding box de YOLO [x1, y1, x2, y2] normalizado [0..1]
+    para compatibilidad hacia atras.
     """
-    tensor = _bgr_a_tensor(imagen_bgr, _YOLO_INPUT_SIZE)
-    salida = _sess_yolo.run(None, {"images": tensor})[0]  # [1, 5, 18900]
-
-    preds  = salida[0]          # [5, 18900]
-    conf   = preds[4]           # [18900]
-    idx    = int(np.argmax(conf))
-    mejor  = float(conf[idx])
-
-    if mejor < _YOLO_CONF_UMBRAL:
+    candidatos = _inferir_bboxes_candidatos_yolo(imagen_bgr)
+    if not candidatos:
         return None
-
-    cx, cy, w, h = preds[0, idx], preds[1, idx], preds[2, idx], preds[3, idx]
-
-    # El modelo retorna coordenadas absolutas en el espacio de la imagen de entrada (960px).
-    # Normalizamos a [0, 1] dividiendo por el tamaño del input.
-    s = float(_YOLO_INPUT_SIZE)
-    x1 = float(np.clip((cx - w / 2) / s, 0.0, 1.0))
-    y1 = float(np.clip((cy - h / 2) / s, 0.0, 1.0))
-    x2 = float(np.clip((cx + w / 2) / s, 0.0, 1.0))
-    y2 = float(np.clip((cy + h / 2) / s, 0.0, 1.0))
-
-
-    return x1, y1, x2, y2
+    H, W = imagen_bgr.shape[:2]
+    _, x1, y1, x2, y2 = candidatos[0]
+    return float(x1 / W), float(y1 / H), float(x2 / W), float(y2 / H)
 
 
 # ---------------------------------------------------------------------------
@@ -145,25 +166,17 @@ def _inferir_bbox_yolo(imagen_bgr):
 # ---------------------------------------------------------------------------
 _LCNET_INPUT_SIZE   = 256   # Shape del modelo: [1, 3, 256, 256]
 _LCNET_HEATMAP_SIZE = 128   # Shape del heatmap de salida: [1, 4, 128, 128]
-_LCNET_CONF_UMBRAL  = 0.05  # Confianza minima del pico del heatmap (escala ~0-1, picos tipicos 0.05-0.80)
+_LCNET_CONF_UMBRAL  = 0.05  # Confianza minima del pico del heatmap
 
 
 def _inferir_esquinas_lcnet(recorte_bgr):
     """
     Ejecuta el modelo LCNet sobre el recorte del documento y retorna las
     4 esquinas como array [4, 2] con coordenadas normalizadas [0..1] relativas
-    al recorte entregado.
-
-    Salida del modelo: [1, 4, 128, 128] (un heatmap por esquina).
-    Orden de esquinas: TL (0), TR (1), BR (2), BL (3).
-
-    Usa centroide ponderado (Gaussian peak fitting) en lugar de argmax para
-    obtener posicion subpixel en el espacio del heatmap, reduciendo el error
-    de cuantizacion de ~35px a ~7px en la imagen original.
+    al recorte entregado, con reconstruccion vectorial si falta 1 esquina.
     """
     tensor   = _bgr_a_tensor(recorte_bgr, _LCNET_INPUT_SIZE)
-    heatmaps = _sess_lcnet.run(None, {"img": tensor})[0]  # [1, 4, 128, 128]
-    heatmaps = heatmaps[0]                                # [4, 128, 128]
+    heatmaps = _sess_lcnet.run(None, {"img": tensor})[0][0]  # [4, 128, 128]
 
     esquinas  = np.zeros((4, 2), dtype=np.float32)
     confianza = np.zeros(4, dtype=np.float32)
@@ -171,14 +184,11 @@ def _inferir_esquinas_lcnet(recorte_bgr):
 
     for k in range(4):
         hm      = heatmaps[k]
-        max_val = float(hm.max())
-        confianza[k] = max_val
+        confianza[k] = float(hm.max())
 
-        # Encontrar el pico (argmax)
         peak_r, peak_c = np.unravel_index(np.argmax(hm), hm.shape)
 
-        # Centroide ponderado en vecindario 9x9 alrededor del pico.
-        # Esto da precision subpixel en el espacio del heatmap (~7x mejor que argmax).
+        # Centroide ponderado en vecindario 9x9 para precision subpixel
         r1 = max(0,   peak_r - 4)
         r2 = min(N,   peak_r + 5)
         c1 = max(0,   peak_c - 4)
@@ -192,19 +202,26 @@ def _inferir_esquinas_lcnet(recorte_bgr):
         else:
             refined_r, refined_c = float(peak_r), float(peak_c)
 
-        # Normalizar a [0, 1] usando N-1 como denominador
-        esquinas[k, 0] = np.clip(refined_c / (N - 1), 0.0, 1.0)  # x (columna)
-        esquinas[k, 1] = np.clip(refined_r / (N - 1), 0.0, 1.0)  # y (fila)
+        esquinas[k, 0] = np.clip(refined_c / (N - 1), 0.0, 1.0)
+        esquinas[k, 1] = np.clip(refined_r / (N - 1), 0.0, 1.0)
 
-    # Validar confianza de cada esquina:
-    # Si >= 3 esquinas tienen buena confianza (>= 0.15), podemos reconstruir la
-    # 4ta esquina faltante usando la relacion de paralelogramo euclidiano.
-    # Esto resuelve casos criticos donde una esquina esta tapada o sobrepuesta
-    # en otra hoja (hoja-sobre-hoja), evitando que una deteccion espuria deforme
-    # el cuadrilatero y arrastre fondos.
-    UMBRAL = 0.15
-    buenas = confianza >= UMBRAL
+    # Validar confianza de esquinas y reconstruccion adaptativa:
+    sorted_confs = np.sort(confianza)[::-1]
+
+    # Caso 1: 4 esquinas buenas
+    if np.sum(confianza >= 0.12) == 4:
+        return esquinas
+
+    # Caso 2: 3 esquinas buenas con umbral adaptativo
+    max_c = sorted_confs[0]
+    umbral = max(0.08, min(0.15, max_c * 0.15))
+    buenas = confianza >= umbral
     num_buenas = int(np.sum(buenas))
+
+    # Caso 3: 2 esquinas excelentes (>= 0.70) y una 3ra solida (>= 0.07)
+    if num_buenas < 3 and sorted_confs[0] >= 0.70 and sorted_confs[1] >= 0.65 and sorted_confs[2] >= 0.07:
+        buenas = confianza >= 0.07
+        num_buenas = int(np.sum(buenas))
 
     if num_buenas < 3:
         return None
@@ -221,8 +238,7 @@ def _inferir_esquinas_lcnet(recorte_bgr):
         elif missing_idx == 3:  # BL faltante
             esquinas[3] = esquinas[0] + esquinas[2] - esquinas[1]
 
-    return esquinas  # [4, 2] en coordenadas normalizadas al recorte
-
+    return esquinas
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +273,7 @@ def _validar_cuadrilatero(pts_norm, ancho, alto):
             if dist < 0.05 * min_lado:
                 return False
 
-    # Verificar aspect ratio del documento (debe ser un ratio razonable <= 2.5)
+    # Verificar aspect ratio del documento
     tl, tr, br, bl = pts_px
     w_top = np.linalg.norm(tr - tl)
     w_bot = np.linalg.norm(br - bl)
@@ -275,28 +291,123 @@ def _validar_cuadrilatero(pts_norm, ancho, alto):
 
 
 # ---------------------------------------------------------------------------
+# Evaluacion de cuadrilateros en una orientacion dada
+# ---------------------------------------------------------------------------
+def _evaluar_deteccion_en_orientacion(imagen_bgr):
+    """
+    Evalua las cajas candidatas de YOLO sobre imagen_bgr y obtiene las esquinas
+    de LCNet con la mejor puntuacion global.
+    """
+    import cv2
+    H, W = imagen_bgr.shape[:2]
+    candidatos = _inferir_bboxes_candidatos_yolo(imagen_bgr)
+    if not candidatos:
+        return None
+
+    mejores_opciones = []
+
+    for c_yolo, x1, y1, x2, y2 in candidatos:
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw < 70 or bh < 70:
+            continue
+
+        # Probar recorte exacto primero, y padding ligero de respaldo
+        variantes = [(0, 0)]
+        pad_x = int(bw * 0.03)
+        pad_y = int(bh * 0.03)
+        if pad_x > 0 or pad_y > 0:
+            variantes.append((pad_x, pad_y))
+
+        for px, py in variantes:
+            rx1 = max(0, x1 - px)
+            ry1 = max(0, y1 - py)
+            rx2 = min(W, x2 + px)
+            ry2 = min(H, y2 + py)
+
+            recorte = imagen_bgr[ry1:ry2, rx1:rx2]
+            rec_h, rec_w = recorte.shape[:2]
+            if rec_w < 60 or rec_h < 60:
+                continue
+
+            esquinas_norm = _inferir_esquinas_lcnet(recorte)
+            if esquinas_norm is None:
+                continue
+
+            if not _validar_cuadrilatero(esquinas_norm, rec_w, rec_h):
+                continue
+
+            esquinas_px = esquinas_norm * np.array([rec_w, rec_h], dtype=np.float32)
+            esquinas_px[:, 0] += rx1
+            esquinas_px[:, 1] += ry1
+
+            area_pts = cv2.contourArea(esquinas_px)
+            area_pct = area_pts / float(W * H)
+            if area_pct < 0.15:
+                continue
+
+            tl, tr, br, bl = esquinas_px
+            w_top = np.linalg.norm(tr - tl)
+            w_bot = np.linalg.norm(br - bl)
+            h_left = np.linalg.norm(bl - tl)
+            h_right = np.linalg.norm(br - tr)
+            w_avg = (w_top + w_bot) / 2.0
+            h_avg = (h_left + h_right) / 2.0
+            if w_avg < 50 or h_avg < 50:
+                continue
+
+            ar = h_avg / w_avg
+
+            # Medir regularidad geométrica del cuadrilátero (paralelismo)
+            diff_w = abs(w_top - w_bot) / max(w_top, w_bot)
+            diff_h = abs(h_left - h_right) / max(h_left, h_right)
+            regularidad = max(0.0, 1.0 - (diff_w + diff_h) / 2.0)
+
+            score = 2.5 + (c_yolo * 0.8) + (regularidad * 1.5)
+
+            # Bonificacion por formato de documento estandar (A4: ~1.41, Carta: ~1.29)
+            if 1.30 <= ar <= 1.52:
+                score += 2.2
+            elif 1.15 <= ar <= 1.85:
+                score += 1.0
+            elif 0.55 <= ar <= 0.85:
+                score += 0.2
+
+            # Penalizar asimetria marcada en lados opuestos (trapecios que arrastran fondos)
+            if diff_w > 0.14:
+                score -= 1.8
+
+            # Bonificacion por documento enfocado
+            if 0.30 <= area_pct <= 0.85:
+                score += 0.8
+
+            mejores_opciones.append({
+                "esquinas_px": esquinas_px,
+                "score": score,
+                "ar": ar,
+                "area_pct": area_pct
+            })
+
+    if not mejores_opciones:
+        return None
+
+    mejores_opciones.sort(key=lambda item: item["score"], reverse=True)
+    return mejores_opciones[0]
+
+
+
+# ---------------------------------------------------------------------------
 # API publica
 # ---------------------------------------------------------------------------
 def detectar_esquinas_documento(imagen_bgr):
     """
     Detecta las 4 esquinas del documento principal en imagen_bgr usando
-    Deep Learning (ONNX) con refinamiento subpixel y reconstruccion de esquinas:
-
-    Flujo:
-      1. YOLO localiza el bounding-box del documento.
-      2. Se recorta esa region (con 10% de padding) para garantizar que
-         las 4 esquinas esten dentro del campo visual de LCNet.
-      3. LCNet predice las 4 esquinas via heatmaps 128x128.
-      4. Centroide ponderado 9x9 da precision subpixel en el heatmap.
-      5. Si 3 de las 4 esquinas son solidas (>= 0.15), la 4ta esquina faltante
-         se completa via algebra vectorial de paralelogramo.
-      6. Validacion de convexidad y aspect ratio.
-      7. Las coordenadas se re-escalan a la resolucion de la imagen original.
+    Deep Learning (ONNX) con analisis multi-orientacion y refinamiento subpixel.
 
     Retorna:
         np.ndarray de shape [4, 2] con las 4 esquinas [TL, TR, BR, BL] en
-        pixeles absolutos de la imagen original (float32).
-        None si la deteccion falla o no supera los umbrales de confianza.
+        pixeles absolutos de imagen_bgr (float32).
+        None si la deteccion falla o no supera los umbrales de calidad.
     """
     if not _cargar_modelos():
         return None
@@ -304,52 +415,57 @@ def detectar_esquinas_documento(imagen_bgr):
     alto_orig, ancho_orig = imagen_bgr.shape[:2]
 
     try:
-        # --- Etapa 1: YOLO detecta el documento ---
-        bbox = _inferir_bbox_yolo(imagen_bgr)
-        if bbox is None:
+        # Prioridad de orientacion segun relacion de aspecto de la foto
+        if ancho_orig > alto_orig:
+            # Foto apaisada: evaluar 90 CCW prioritariamente
+            orientaciones = [
+                (cv2.ROTATE_90_COUNTERCLOCKWISE, "90_CCW"),
+                (None, "0_DEG"),
+                (cv2.ROTATE_90_CLOCKWISE, "90_CW")
+            ]
+        else:
+            orientaciones = [
+                (None, "0_DEG"),
+                (cv2.ROTATE_90_COUNTERCLOCKWISE, "90_CCW"),
+                (cv2.ROTATE_90_CLOCKWISE, "90_CW")
+            ]
+
+        todas_detecciones = []
+
+        for rot_code, rot_name in orientaciones:
+            im_rot = imagen_bgr if rot_code is None else cv2.rotate(imagen_bgr, rot_code)
+            res = _evaluar_deteccion_en_orientacion(im_rot)
+            if res is not None:
+                todas_detecciones.append((res, rot_code))
+                # Si encontramos una deteccion vertical con score excepcional, no es necesario seguir
+                if res["score"] >= 4.5 and res["ar"] >= 1.2:
+                    break
+
+        if not todas_detecciones:
             return None
 
-        x1_n, y1_n, x2_n, y2_n = bbox
+        todas_detecciones.sort(key=lambda item: item[0]["score"], reverse=True)
+        mejor_res, mejor_rot = todas_detecciones[0]
 
-        # Expandir el bbox con un margen del 10% para garantizar que las 4 esquinas
-        # queden dentro del recorte aun cuando el YOLO ajusta justo al borde del documento.
-        pad_x = (x2_n - x1_n) * 0.10
-        pad_y = (y2_n - y1_n) * 0.10
-        x1_n = max(0.0, x1_n - pad_x)
-        y1_n = max(0.0, y1_n - pad_y)
-        x2_n = min(1.0, x2_n + pad_x)
-        y2_n = min(1.0, y2_n + pad_y)
+        pts_rot = mejor_res["esquinas_px"]
+        if mejor_rot is None:
+            return pts_rot.astype(np.float32)
 
-        # Pasar de coordenadas normalizadas a pixeles
-        x1 = max(0, int(x1_n * ancho_orig))
-        y1 = max(0, int(y1_n * alto_orig))
-        x2 = min(ancho_orig, int(x2_n * ancho_orig))
-        y2 = min(alto_orig,  int(y2_n * alto_orig))
+        # Des-rotar coordenadas a la imagen original
+        pts_orig = np.zeros_like(pts_rot)
+        if mejor_rot == cv2.ROTATE_90_COUNTERCLOCKWISE:
+            # im_rot: ancho = alto_orig, alto = ancho_orig
+            # x_orig = ancho_orig - 1 - y_rot
+            # y_orig = x_rot
+            pts_orig[:, 0] = ancho_orig - 1 - pts_rot[:, 1]
+            pts_orig[:, 1] = pts_rot[:, 0]
+        elif mejor_rot == cv2.ROTATE_90_CLOCKWISE:
+            pts_orig[:, 0] = pts_rot[:, 1]
+            pts_orig[:, 1] = alto_orig - 1 - pts_rot[:, 0]
 
-        if (x2 - x1) < 50 or (y2 - y1) < 50:
-            return None
-
-        recorte = imagen_bgr[y1:y2, x1:x2]
-
-        # --- Etapa 2: LCNet predice las 4 esquinas en el recorte ---
-        esquinas_norm = _inferir_esquinas_lcnet(recorte)
-        if esquinas_norm is None:
-            return None
-
-        ancho_rec = x2 - x1
-        alto_rec  = y2 - y1
-
-        if not _validar_cuadrilatero(esquinas_norm, ancho_rec, alto_rec):
-            return None
-
-        # --- Re-escalar esquinas al espacio de la imagen original ---
-        esquinas_px = esquinas_norm * np.array([ancho_rec, alto_rec], dtype=np.float32)
-        esquinas_px[:, 0] += x1   # desplazar en X
-        esquinas_px[:, 1] += y1   # desplazar en Y
-
-        return esquinas_px.astype(np.float32)
-
+        return pts_orig.astype(np.float32)
 
     except Exception as e:
         print(f"[DocDetector] Error durante inferencia: {e}")
         return None
+

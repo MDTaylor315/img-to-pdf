@@ -106,12 +106,15 @@ def ordenar_cuatro_puntos(pts):
     rect[3] = pts[np.argmax(diff)]  # Bottom-Left (diferencia y-x máxima)
     return rect
 
-def aplicar_perspectiva_cuatro_puntos(imagen_bgr, pts):
+def aplicar_perspectiva_cuatro_puntos(imagen_bgr, pts, ya_ordenados=False):
     """
     Aplica transformacion de perspectiva para desdoblar la hoja y estirarla
     de esquina a esquina a un rectangulo perfecto, eliminando fondos diagonales.
     """
-    rect = ordenar_cuatro_puntos(pts)
+    if ya_ordenados:
+        rect = pts.astype(np.float32)
+    else:
+        rect = ordenar_cuatro_puntos(pts)
     (tl, tr, br, bl) = rect
 
     # Calcular ancho proyectado como promedio de los dos lados horizontales.
@@ -244,20 +247,15 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         esquinas_dl = _doc_detector.detectar_esquinas_documento(imagen_bgr)
         if esquinas_dl is not None:
             area_dl = cv2.contourArea(esquinas_dl) / float(ancho_orig * alto_orig)
-            # Guardia de Cobertura: si OpenCV ve que la hoja cubre >= 55% de la foto pero DL
-            # sólo detectó una fracción (< 55% o < 65% de la silueta real, ej. manual arrugado en Pag 1 y Pag 3),
-            # descartamos DL para no cortar la página a la mitad y dejamos que OpenCV capture el documento completo.
-            usar_dl = True
-            if pct_papel_global >= 0.55 and area_dl < 0.50:
-                usar_dl = False
-            elif pct_papel_global >= 0.65 and area_dl < (pct_papel_global * 0.60):
-                usar_dl = False
+            # Aceptar DL si detecta un cuadrilátero sustancial del documento (>= 15% de la foto)
+            usar_dl = area_dl >= 0.15
 
             if usar_dl:
-                desdoblada, ok = aplicar_perspectiva_cuatro_puntos(imagen_bgr, esquinas_dl)
+                desdoblada, ok = aplicar_perspectiva_cuatro_puntos(imagen_bgr, esquinas_dl, ya_ordenados=True)
                 if ok:
                     desdoblada = recortar_bordes_residuales(desdoblada)
                     return desdoblada, True
+
 
     # --- TIER 1: DETECCION DE 4 ESQUINAS DE PAPEL Y CORRECCION DE PERSPECTIVA ---
     blur = cv2.GaussianBlur(grises, (5, 5), 0)
