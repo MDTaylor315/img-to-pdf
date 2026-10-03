@@ -316,11 +316,12 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
     if not candidatos:
         candidatos = []
     # Evaluar siempre la imagen completa para que LCNet pueda inferir esquinas directas
-    candidatos.append((0.50, 0, 0, W, H))
+    candidatos_lcnet = list(candidatos)
+    candidatos_lcnet.append((0.50, 0, 0, W, H))
 
     mejores_opciones = []
 
-    for c_yolo, x1, y1, x2, y2 in candidatos:
+    for c_yolo, x1, y1, x2, y2 in candidatos_lcnet:
         bw = x2 - x1
         bh = y2 - y1
         if bw < 70 or bh < 70:
@@ -371,6 +372,7 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
                 continue
 
             ar = h_avg / w_avg
+            doc_ratio = max(ar, 1.0 / ar)
 
             # Medir regularidad geométrica del cuadrilátero (paralelismo)
             diff_w = abs(w_top - w_bot) / max(w_top, w_bot)
@@ -387,21 +389,18 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
 
             score = 2.5 + (c_yolo * 0.8) + (regularidad * 1.5)
 
-            # Bonificacion por formato de documento estandar (A4: ~1.41, Carta: ~1.29)
-            if 1.30 <= ar <= 1.52:
+            # Bonificacion simétrica por formato de documento estándar (A4/Carta vertical u horizontal)
+            if 1.20 <= doc_ratio <= 1.95:
                 score += 2.2
-            elif 1.15 <= ar <= 1.85:
-                score += 1.0
-            elif 0.55 <= ar <= 0.85:
-                score += 0.2
+            elif 1.10 <= doc_ratio <= 2.20:
+                score += 1.2
 
             # Penalizar asimetria marcada en lados opuestos (trapecios que arrastran fondos)
-            if diff_w > 0.14:
+            if diff_w > 0.14 or diff_h > 0.14:
                 score -= 1.8
 
-            # Bonificacion por documento enfocado
-            if 0.30 <= area_pct <= 0.85:
-                score += 0.8
+            # Bonificación proporcional a la cobertura del documento (favorece la hoja completa vs fragmentos)
+            score += (area_pct ** 1.5) * 4.0
 
             mejores_opciones.append({
                 "esquinas_px": esquinas_px,
@@ -410,12 +409,16 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
                 "area_pct": area_pct
             })
 
-        # Candidato ortogonal directo de YOLO:
-        # Si YOLO detecta una caja con buen aspect ratio de documento vertical
-        if c_yolo >= 0.12:
+    # Candidato ortogonal directo de YOLO:
+    # Solo para detecciones reales de YOLO (excluyendo el dummy de imagen completa)
+    for c_yolo, x1, y1, x2, y2 in candidatos:
+        bw = x2 - x1
+        bh = y2 - y1
+        box_area_pct = float(bw * bh) / float(W * H)
+        if c_yolo >= 0.15 and 0.25 <= box_area_pct <= 0.85:
             box_ar = float(bh) / float(bw)
-            box_area_pct = float(bw * bh) / float(W * H)
-            if 1.15 <= box_ar <= 1.55 and box_area_pct >= 0.25:
+            box_ratio = max(box_ar, 1.0 / box_ar)
+            if 1.15 <= box_ratio <= 1.65:
                 pts_bbox = np.array([
                     [x1, y1],
                     [x2, y1],
@@ -423,8 +426,9 @@ def _evaluar_deteccion_en_orientacion(imagen_bgr):
                     [x1, y2]
                 ], dtype=np.float32)
                 box_score = 3.0 + (c_yolo * 1.5)
-                if 1.30 <= box_ar <= 1.48:
+                if 1.25 <= box_ratio <= 1.52:
                     box_score += 1.0
+                box_score += (box_area_pct ** 1.5) * 4.0
                 mejores_opciones.append({
                     "esquinas_px": pts_bbox,
                     "score": box_score,
@@ -459,18 +463,19 @@ def detectar_esquinas_documento(imagen_bgr):
     alto_orig, ancho_orig = imagen_bgr.shape[:2]
 
     try:
-        # Prioridad de orientacion segun relacion de aspecto de la foto
+        # Evaluar sistemáticamente las 4 orientaciones para robustez total
         if ancho_orig > alto_orig:
-            # Foto apaisada: evaluar 90 CCW prioritariamente
             orientaciones = [
                 (cv2.ROTATE_90_COUNTERCLOCKWISE, "90_CCW"),
                 (None, "0_DEG"),
+                (cv2.ROTATE_180, "180_DEG"),
                 (cv2.ROTATE_90_CLOCKWISE, "90_CW")
             ]
         else:
             orientaciones = [
                 (None, "0_DEG"),
                 (cv2.ROTATE_90_COUNTERCLOCKWISE, "90_CCW"),
+                (cv2.ROTATE_180, "180_DEG"),
                 (cv2.ROTATE_90_CLOCKWISE, "90_CW")
             ]
 
@@ -481,8 +486,8 @@ def detectar_esquinas_documento(imagen_bgr):
             res = _evaluar_deteccion_en_orientacion(im_rot)
             if res is not None:
                 todas_detecciones.append((res, rot_code))
-                # Si encontramos una deteccion vertical con score excepcional, no es necesario seguir
-                if res["score"] >= 4.5 and res["ar"] >= 1.2:
+                # Cortar anticipadamente solo si la detección tiene cobertura casi total y score superlativo
+                if res["score"] >= 9.2 and res["area_pct"] >= 0.85:
                     break
 
         if not todas_detecciones:
@@ -493,21 +498,30 @@ def detectar_esquinas_documento(imagen_bgr):
 
         pts_rot = mejor_res["esquinas_px"]
         if mejor_rot is None:
-            return pts_rot.astype(np.float32)
-
-        # Des-rotar coordenadas a la imagen original
-        pts_orig = np.zeros_like(pts_rot)
-        if mejor_rot == cv2.ROTATE_90_COUNTERCLOCKWISE:
-            # im_rot: ancho = alto_orig, alto = ancho_orig
-            # x_orig = ancho_orig - 1 - y_rot
-            # y_orig = x_rot
+            pts_orig = pts_rot.copy()
+        elif mejor_rot == cv2.ROTATE_90_COUNTERCLOCKWISE:
+            pts_orig = np.zeros_like(pts_rot)
             pts_orig[:, 0] = ancho_orig - 1 - pts_rot[:, 1]
             pts_orig[:, 1] = pts_rot[:, 0]
         elif mejor_rot == cv2.ROTATE_90_CLOCKWISE:
+            pts_orig = np.zeros_like(pts_rot)
             pts_orig[:, 0] = pts_rot[:, 1]
             pts_orig[:, 1] = alto_orig - 1 - pts_rot[:, 0]
+        elif mejor_rot == cv2.ROTATE_180:
+            pts_orig = np.zeros_like(pts_rot)
+            pts_orig[:, 0] = ancho_orig - 1 - pts_rot[:, 0]
+            pts_orig[:, 1] = alto_orig - 1 - pts_rot[:, 1]
 
-        return pts_orig.astype(np.float32)
+        # Ordenar canónicamente [TL, TR, BR, BL] para que la perspectiva siempre sea ortogonal y derecha
+        rect = np.zeros((4, 2), dtype=np.float32)
+        s = pts_orig.sum(axis=1)
+        rect[0] = pts_orig[np.argmin(s)]  # Top-Left (suma x+y mínima)
+        rect[2] = pts_orig[np.argmax(s)]  # Bottom-Right (suma x+y máxima)
+        diff = np.diff(pts_orig, axis=1)
+        rect[1] = pts_orig[np.argmin(diff)]  # Top-Right (diferencia y-x mínima)
+        rect[3] = pts_orig[np.argmax(diff)]  # Bottom-Left (diferencia y-x máxima)
+
+        return rect
 
     except Exception as e:
         print(f"[DocDetector] Error durante inferencia: {e}")

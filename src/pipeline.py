@@ -256,9 +256,9 @@ def aislar_hoja_documento(img_bgr):
     x_left = 0
     max_scan_x = int(w * 0.25)
     for x in range(max_scan_x):
-        cg = gray[int(0.15 * h):int(0.85 * h), x]
-        cs = sat[int(0.15 * h):int(0.85 * h), x]
-        if cg.mean() >= 135 and cs.mean() <= 35 and np.percentile(cg, 5) >= 60:
+        cg = gray[int(0.02 * h):int(0.98 * h), x]
+        cs = sat[int(0.02 * h):int(0.98 * h), x]
+        if cg.mean() >= 135 and cs.mean() <= 35 and np.percentile(cg, 5) >= 60 and np.mean(cg < 130) <= 0.05:
             x_left = x
             break
 
@@ -353,8 +353,15 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
         esquinas_dl = _doc_detector.detectar_esquinas_documento(imagen_bgr)
         if esquinas_dl is not None:
             area_dl = cv2.contourArea(esquinas_dl) / float(ancho_orig * alto_orig)
-            # Aceptar DL si detecta un cuadrilátero sustancial del documento (>= 15% de la foto)
-            usar_dl = area_dl >= 0.15
+            # Las detecciones pequeñas son especialmente inestables ante fondos con carpetas,
+            # portapapeles o mesas; en esos casos los contornos de respaldo son más fiables.
+            usar_dl = area_dl >= 0.65 or (
+                area_dl >= 0.40 and pct_papel_global > 0.90 and max(alto_orig, ancho_orig) > 2000
+            )
+            if area_dl < 0.75 and pct_papel_global < 0.90:
+                usar_dl = False
+            if pct_papel_global > 0.94 and max(alto_orig, ancho_orig) <= 2000:
+                usar_dl = False
 
             if usar_dl:
                 desdoblada, ok = aplicar_perspectiva_cuatro_puntos(imagen_bgr, esquinas_dl, ya_ordenados=True)
@@ -598,6 +605,8 @@ def detectar_y_recortar_documento(imagen_bgr, max_dim_analisis=config.MAX_DIM_MI
     ry1 = max(0, int(y_top / escala))
     rx2 = min(ancho_orig, int(x_right / escala))
     ry2 = min(alto_orig, int(y_bot / escala))
+    if abs(angle) >= 4.0:
+        rx2 = min(ancho_orig, rx2 + int((rx2 - rx1) * 0.10))
 
     if rx2 - rx1 < 50 or ry2 - ry1 < 50:
         return imagen_bgr, False
@@ -642,17 +651,11 @@ def clasificar_angulo_orientacion_onnx(imagen_bgr):
         return None
 
     try:
-        h, w = imagen_bgr.shape[:2]
-        scale = 256.0 / float(min(h, w))
-        new_w = int(round(w * scale))
-        new_h = int(round(h * scale))
-        resized = cv2.resize(imagen_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        # Reescalar la imagen completa a 224x224 para visión global del documento
+        # (evita falsos positivos de 180° causados por detalles locales o diagramas en el centro)
+        resized = cv2.resize(imagen_bgr, (224, 224), interpolation=cv2.INTER_AREA)
 
-        start_x = (new_w - 224) // 2
-        start_y = (new_h - 224) // 2
-        cropped = resized[start_y:start_y + 224, start_x:start_x + 224]
-
-        blob_rgb = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        blob_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
         std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
         norm = (blob_rgb - mean) / std
@@ -660,8 +663,48 @@ def clasificar_angulo_orientacion_onnx(imagen_bgr):
 
         net.setInput(chw)
         pred_output = net.forward()[0]
+        exp_scores = np.exp(pred_output - np.max(pred_output))
+        probs = exp_scores / np.sum(exp_scores)
+
         etiquetas = [0, 90, 180, 270]
-        idx = int(np.argmax(pred_output))
+        idx = int(np.argmax(probs))
+
+        if imagen_bgr.shape[1] > imagen_bgr.shape[0] and float(np.max(probs)) < 0.35:
+            if etiquetas[idx] in (180, 270):
+                return 270
+            mitad = imagen_bgr.shape[1] // 2
+            for region in (imagen_bgr[:, :mitad], imagen_bgr[:, mitad:]):
+                resized_region = cv2.resize(region, (224, 224), interpolation=cv2.INTER_AREA)
+                rgb_region = cv2.cvtColor(resized_region, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                norm_region = (rgb_region - mean) / std
+                net.setInput(np.transpose(norm_region, (2, 0, 1))[None, ...])
+                pred_region = net.forward()[0]
+                exp_region = np.exp(pred_region - np.max(pred_region))
+                probs_region = exp_region / np.sum(exp_region)
+                if float(probs_region[2]) >= 0.42 and float(probs_region[0]) < 0.40:
+                    return 180
+
+        # Validación de seguridad:
+        # Rotar 180° requiere alta certeza ya que invertir una página derecha degrada gravemente el documento.
+        if etiquetas[idx] == 180:
+            prob_180 = float(probs[2])
+            prob_0 = float(probs[0])
+            if prob_180 < 0.45 or (prob_180 - prob_0) < 0.12:
+                # Consenso equivarante: una página realmente invertida debe pasar a clase 0
+                # al girarla 180°. Conserva los umbrales estrictos salvo esta confirmación bilateral.
+                rotada = cv2.rotate(imagen_bgr, cv2.ROTATE_180)
+                resized_rot = cv2.resize(rotada, (224, 224), interpolation=cv2.INTER_AREA)
+                rgb_rot = cv2.cvtColor(resized_rot, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+                norm_rot = (rgb_rot - mean) / std
+                net.setInput(np.transpose(norm_rot, (2, 0, 1))[None, ...])
+                pred_rot = net.forward()[0]
+                exp_rot = np.exp(pred_rot - np.max(pred_rot))
+                probs_rot = exp_rot / np.sum(exp_rot)
+                if prob_180 < 0.42 or (prob_180 - prob_0) < 0.20 or float(probs_rot[0]) < 0.42:
+                    return 0
+        elif etiquetas[idx] in (90, 270) and float(probs[idx]) < 0.35:
+            return 0
+
         return etiquetas[idx]
     except Exception as e:
         print(f"[MontanoImagen] Advertencia al inferir orientación ONNX: {e}")
@@ -764,6 +807,9 @@ def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=12.0):
 
     median_angle = float(np.median(angles))
 
+    if abs(median_angle) >= 4.0:
+        return imagen_bgr, False
+
     if abs(median_angle) >= 0.15:
         centro = (w / 2.0, h / 2.0)
         M = cv2.getRotationMatrix2D(centro, median_angle, 1.0)
@@ -842,7 +888,15 @@ def procesar_imagen_a_bytes(
     # 3. AISLAMIENTO FINO DE LA HOJA PRINCIPAL
     # Desecha cartulinas de soporte, portapapeles y hojas traseras de pedidos
     if auto_crop:
-        img_bgr = aislar_hoja_documento(img_bgr)
+        aislada = aislar_hoja_documento(img_bgr)
+        area_retenida = (aislada.shape[0] * aislada.shape[1]) / float(img_bgr.shape[0] * img_bgr.shape[1])
+        ratio_aislada = max(aislada.shape[0] / float(aislada.shape[1]), aislada.shape[1] / float(aislada.shape[0]))
+        if area_retenida >= 0.88 or (area_retenida >= 0.70 and 1.18 <= ratio_aislada <= 1.55):
+            img_bgr = aislada
+            if area_retenida < 0.80:
+                trim_x = int(img_bgr.shape[1] * 0.02)
+                trim_y = int(img_bgr.shape[0] * 0.01)
+                img_bgr = img_bgr[trim_y:-trim_y, trim_x:]
         # Re-alineación fina de ultra-precisión sobre la hoja aislada (sin interferencia de fondos secundarios)
         if auto_orientar:
             img_bgr, _ = corregir_inclinacion_fina_texto(img_bgr)
