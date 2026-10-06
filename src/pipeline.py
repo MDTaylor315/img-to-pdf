@@ -4,6 +4,7 @@ import gc
 import cv2
 import numpy as np
 import img2pdf
+from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageOps
 
 import importlib
@@ -33,31 +34,45 @@ except (ImportError, ValueError):
 # Aplicar límite de hilos para hora punta
 cv2.setNumThreads(config.NUM_HILOS_OPENCV)
 
-def redimensionar_si_es_necesario(imagen_bgr, max_dim=config.MAX_DIM_IMAGEN):
+
+class ErrorValidacionEntrada(ValueError):
+    """Error controlado con mensaje JSON para el cliente."""
+    def __init__(self, mensaje, codigo=400):
+        self.mensaje = mensaje
+        self.codigo = codigo
+        super().__init__(mensaje)
+
+
+def redimensionar_si_es_necesario(imagen_bgr, max_dim=config.MAX_DIMENSION_IMAGEN):
     """
-    Redimensiona la imagen si supera max_dim px.
+    Redimensiona la imagen si su dimensión mayor supera max_dim px.
+    Se usa como tope de seguridad durante el procesamiento OpenCV para evitar
+    costos excesivos con fotos de resolución muy alta; el re-encodeo final con
+    Pillow aplica el límite exacto de ancho (2480 px) usando LANCZOS.
     """
     alto, ancho = imagen_bgr.shape[:2]
     dim_mayor = max(alto, ancho)
-    
+
     if dim_mayor > max_dim:
         escala = max_dim / float(dim_mayor)
         nuevo_ancho = int(ancho * escala)
         nuevo_alto = int(alto * escala)
         return cv2.resize(imagen_bgr, (nuevo_ancho, nuevo_alto), interpolation=cv2.INTER_AREA)
-    
+
     return imagen_bgr
 
 def cargar_imagen_corregida_exif(origen_imagen):
     """
     Carga una imagen respetando la orientación EXIF de la cámara del celular.
+    Si la imagen supera el ancho máximo configurado, se reduce con Pillow
+    (LANCZOS) antes de pasar a OpenCV, acelerando todo el pipeline.
     """
     origen = io.BytesIO(origen_imagen) if isinstance(origen_imagen, (bytes, bytearray)) else origen_imagen
 
     with Image.open(origen) as img_pil:
         if img_pil.format not in config.FORMATOS_IMAGEN_PERMITIDOS:
             raise ValueError(
-                "Formato de imagen no permitido. Use JPEG, PNG o WebP."
+                "Formato de imagen no permitido. Use JPEG, PNG, WebP o HEIC."
             )
 
         ancho, alto = img_pil.size
@@ -71,8 +86,17 @@ def cargar_imagen_corregida_exif(origen_imagen):
 
         img_pil = ImageOps.exif_transpose(img_pil)
         img_pil = img_pil.convert('RGB')
+
+        # Pre-downscale para acelerar detección de documento/filtros: el re-encodeo
+        # final con Pillow volverá a aplicar LANCZOS a 2480 px si aún fuera necesario.
+        max_ancho = getattr(config, "MAX_ANCHO_IMAGEN", 2480)
+        if img_pil.width > max_ancho:
+            ratio = max_ancho / float(img_pil.width)
+            nuevo_alto = int(img_pil.height * ratio)
+            img_pil = img_pil.resize((max_ancho, nuevo_alto), Image.LANCZOS)
+
         imagen_np = np.asarray(img_pil)
-    
+
     return cv2.cvtColor(imagen_np, cv2.COLOR_RGB2BGR)
 
 def recortar_recortes_secundarios_papel(mini_thresh, x, y, w, h):
@@ -828,15 +852,33 @@ def corregir_inclinacion_fina_texto(imagen_bgr, max_angulo=12.0):
 
 
 
-def corregir_iluminacion_suave(imagen_grises):
+def corregir_iluminacion_suave(imagen_grises, max_lado_miniatura=400):
+    """
+    Corrige iluminación suave calculando un fondo difuminado.
+    Para acelerar el GaussianBlur con sigmas grandes, se trabaja sobre una
+    miniatura y luego se interpola al tamaño original. La aproximación es
+    visualmente indistinguible para el blanqueo de fondo y reduce el tiempo
+    de procesamiento de varios segundos a unos pocos cientos de ms.
+    """
     alto, ancho = imagen_grises.shape[:2]
-    sigma_val = max(35, int(min(alto, ancho) * 0.05))
-    
-    fondo = cv2.GaussianBlur(imagen_grises, (0, 0), sigmaX=sigma_val, sigmaY=sigma_val)
-    
+    lado_menor = min(alto, ancho)
+
+    escala = min(1.0, max_lado_miniatura / float(lado_menor))
+    sigma_original = max(35, int(lado_menor * 0.05))
+
+    if escala < 1.0:
+        nuevo_ancho = max(1, int(ancho * escala))
+        nuevo_alto = max(1, int(alto * escala))
+        mini = cv2.resize(imagen_grises, (nuevo_ancho, nuevo_alto), interpolation=cv2.INTER_AREA)
+        sigma_mini = max(5, int(sigma_original * escala))
+        fondo_mini = cv2.GaussianBlur(mini, (0, 0), sigmaX=sigma_mini, sigmaY=sigma_mini)
+        fondo = cv2.resize(fondo_mini, (ancho, alto), interpolation=cv2.INTER_LINEAR)
+    else:
+        fondo = cv2.GaussianBlur(imagen_grises, (0, 0), sigmaX=sigma_original, sigmaY=sigma_original)
+
     imagen_float = imagen_grises.astype(np.float32)
     fondo_float = fondo.astype(np.float32)
-    
+
     resultado = (imagen_float / (fondo_float + 1e-5)) * 255.0
     return np.clip(resultado, 0, 255).astype(np.uint8)
 
@@ -862,6 +904,37 @@ def binarizar_sauvola(imagen_grises, window_size=21, c_val=10):
         imagen_grises, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, window_size, C=c_val
     )
+
+def _guardar_jpeg_final_pil(imagen_grises):
+    """
+    Re-encodea la imagen procesada como JPEG con Pillow garantizando:
+      - Ancho máximo de 2480 px (≈ A4 a 300 dpi de ancho).
+      - Calidad 85 con optimización de Huffman.
+      - DPI incrustado (300, 300).
+    """
+    if imagen_grises.ndim == 2:
+        img_pil = Image.fromarray(imagen_grises, mode="L")
+    else:
+        img_pil = Image.fromarray(cv2.cvtColor(imagen_grises, cv2.COLOR_BGR2RGB))
+
+    ancho = img_pil.width
+    max_ancho = getattr(config, "MAX_ANCHO_IMAGEN", 2480)
+
+    if ancho > max_ancho:
+        ratio = max_ancho / float(ancho)
+        nuevo_alto = int(img_pil.height * ratio)
+        img_pil = img_pil.resize((max_ancho, nuevo_alto), Image.LANCZOS)
+
+    buffer = io.BytesIO()
+    img_pil.save(
+        buffer,
+        format="JPEG",
+        quality=config.CALIDAD_JPEG,
+        optimize=True,
+        dpi=getattr(config, "JPEG_DPI", (300, 300)),
+    )
+    return buffer.getvalue()
+
 
 def procesar_imagen_a_bytes(
     origen_imagen,
@@ -901,7 +974,7 @@ def procesar_imagen_a_bytes(
         if auto_orientar:
             img_bgr, _ = corregir_inclinacion_fina_texto(img_bgr)
 
-    img_bgr = redimensionar_si_es_necesario(img_bgr, max_dim=config.MAX_DIM_IMAGEN)
+    img_bgr = redimensionar_si_es_necesario(img_bgr, max_dim=config.MAX_DIMENSION_IMAGEN)
 
     grises = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
@@ -913,14 +986,10 @@ def procesar_imagen_a_bytes(
     else:
         resultado_final = grises
 
-    exito, buffer_jpg = cv2.imencode(".jpg", resultado_final, [cv2.IMWRITE_JPEG_QUALITY, config.CALIDAD_JPEG])
-    if not exito:
-        raise RuntimeError("Error al codificar imagen en memoria RAM")
-
-    bytes_resultado = buffer_jpg.tobytes()
+    bytes_resultado = _guardar_jpeg_final_pil(resultado_final)
 
     # LIBERACIÓN DE MEMORIA RAM EXPLÍCITA POR PÁGINA
-    del img_bgr, grises, resultado_final, buffer_jpg
+    del img_bgr, grises, resultado_final
     if config.LIMPIAR_RAM_POR_PAGINA:
         gc.collect()
 
@@ -932,16 +1001,35 @@ def convertir_imagenes_a_pdf_bytes(
     modo=config.MODO_PROCESAMIENTO_DEFECTO,
     auto_crop=config.USAR_AUTO_CROP_DEFECTO,
     auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
+    max_workers=None,
 ):
     if not lista_origenes_imagenes:
         raise ValueError("Debe proporcionar al menos una imagen.")
 
-    buffers_jpeg = [
-        procesar_imagen_a_bytes(
+    # Calentar sesiones ONNX para evitar condiciones de carrera en el pool.
+    if getattr(config, "USAR_DETECTOR_DL", True):
+        _doc_detector._cargar_modelos()
+    if getattr(config, "USAR_MODELO_ORIENTACION_ONNX", True):
+        obtener_red_orientacion()
+
+    if max_workers is None:
+        # Por defecto usamos el valor de config (4). OpenCV y ONNX liberan el GIL,
+        # así que el paralelismo real aprovecha múltiples núcleos sin aumentar NUM_HILOS_OPENCV.
+        max_workers = getattr(config, "MAX_WORKERS_PROCESAMIENTO", 4)
+        max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = max(1, min(max_workers, len(lista_origenes_imagenes)))
+
+    def _procesar(origen):
+        return procesar_imagen_a_bytes(
             origen, modo=modo, auto_crop=auto_crop, auto_orientar=auto_orientar
         )
-        for origen in lista_origenes_imagenes
-    ]
+
+    if max_workers == 1:
+        buffers_jpeg = [_procesar(o) for o in lista_origenes_imagenes]
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            buffers_jpeg = list(executor.map(_procesar, lista_origenes_imagenes))
+
     try:
         return img2pdf.convert(
             buffers_jpeg,
@@ -998,6 +1086,135 @@ def procesar_documento(
     with open(ruta_pdf_salida, "wb") as f:
         f.write(img2pdf.convert(bytes_jpg, rotation=img2pdf.Rotation.none))
     print(f"--> PDF generado con éxito en: {ruta_pdf_salida}\n")
+
+
+# -----------------------------------------------------------------------------
+# Helpers de validación para el endpoint HTTP /api/gd/imagenes_pdf
+# -----------------------------------------------------------------------------
+_FORMATO_POR_EXTENSION = {
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".png": "PNG",
+    ".webp": "WEBP",
+    ".heic": "HEIC",
+    ".heif": "HEIF",
+}
+_EXTENSIONES_PERMITIDAS = frozenset(_FORMATO_POR_EXTENSION.keys())
+
+
+def validar_fotos_multipart(db, id_user, archivos):
+    """
+    Valida los campos del request multipart del endpoint.
+
+    Parámetros
+    ----------
+    db : str
+        Valor del campo 'db'.
+    id_user : str
+        Valor del campo 'id_user'.
+    archivos : iterable
+        Fotos recibidas en el campo 'fotos' (puede haber varias con el mismo
+        nombre). Cada elemento debe tener atributos `filename` y un método
+        `read()` que devuelva bytes.
+
+    Retorna
+    -------
+    list[bytes]
+        Lista con los bytes de cada foto validada.
+
+    Excepciones
+    -----------
+    ErrorValidacionEntrada
+        Con `codigo` HTTP y `mensaje` explicativo.
+    """
+    if not db or not isinstance(db, str) or not db.strip():
+        raise ErrorValidacionEntrada("Falta el campo obligatorio 'db'.")
+    if id_user is None or (isinstance(id_user, str) and not id_user.strip()):
+        raise ErrorValidacionEntrada("Falta el campo obligatorio 'id_user'.")
+
+    if not archivos:
+        raise ErrorValidacionEntrada("Debe enviar al menos una foto en el campo 'fotos'.")
+    if len(archivos) > config.MAX_CANTIDAD_FOTOS:
+        raise ErrorValidacionEntrada(
+            f"Se excede la cantidad máxima de fotos ({config.MAX_CANTIDAD_FOTOS})."
+        )
+
+    fotos_bytes = []
+    total_bytes = 0
+
+    for archivo in archivos:
+        filename = getattr(archivo, "filename", None) or ""
+        ext = os.path.splitext(filename.lower())[1]
+
+        if ext not in _EXTENSIONES_PERMITIDAS:
+            raise ErrorValidacionEntrada(
+                f"Formato no soportado para '{filename}'. "
+                "Use JPEG, PNG, WebP o HEIC."
+            )
+
+        try:
+            contenido = archivo.read() if hasattr(archivo, "read") else archivo
+        except Exception as e:
+            raise ErrorValidacionEntrada(
+                f"No se pudo leer el archivo '{filename}': {e}"
+            )
+
+        if isinstance(contenido, str):
+            raise ErrorValidacionEntrada(
+                f"El archivo '{filename}' debe enviarse en modo binario."
+            )
+        if not contenido:
+            raise ErrorValidacionEntrada(f"El archivo '{filename}' está vacío.")
+
+        if len(contenido) > config.MAX_BYTES_POR_FOTO:
+            raise ErrorValidacionEntrada(
+                f"El archivo '{filename}' excede el tamaño máximo por foto "
+                f"({config.MAX_BYTES_POR_FOTO // (1024 * 1024)} MB)."
+            )
+
+        total_bytes += len(contenido)
+        if total_bytes > config.MAX_BYTES_TOTALES:
+            raise ErrorValidacionEntrada(
+                f"El total de fotos excede el límite de "
+                f"{config.MAX_BYTES_TOTALES // (1024 * 1024)} MB."
+            )
+
+        try:
+            with Image.open(io.BytesIO(contenido)) as img_pil:
+                if img_pil.format not in config.FORMATOS_IMAGEN_PERMITIDOS:
+                    raise ErrorValidacionEntrada(
+                        f"Formato de imagen no soportado para '{filename}'. "
+                        "Use JPEG, PNG, WebP o HEIC."
+                    )
+                ancho, alto = img_pil.size
+                if (
+                    ancho <= 0
+                    or alto <= 0
+                    or ancho * alto > config.MAX_PIXELES_POR_FOTO
+                ):
+                    raise ErrorValidacionEntrada(
+                        f"La imagen '{filename}' tiene dimensiones no válidas "
+                        "o supera la resolución máxima permitida."
+                    )
+        except ErrorValidacionEntrada:
+            raise
+        except Exception as e:
+            raise ErrorValidacionEntrada(
+                f"La imagen '{filename}' no pudo ser procesada: {e}"
+            )
+
+        fotos_bytes.append(contenido)
+
+    return fotos_bytes
+
+
+def convertir_fotos_a_pdf_endpoint(db, id_user, archivos, **kwargs):
+    """
+    Flujo completo de validación + generación de PDF para el endpoint.
+    Levanta ErrorValidacionEntrada si la entrada no es válida.
+    """
+    fotos_bytes = validar_fotos_multipart(db, id_user, archivos)
+    return convertir_imagenes_a_pdf_bytes(fotos_bytes, **kwargs)
 
 
 if __name__ == "__main__":

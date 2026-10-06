@@ -56,14 +56,24 @@ Puedes ajustar los parámetros de rendimiento y calidad en `src/config.py`:
 # Hilos de CPU por proceso (1 para servidores web concurrentes)
 NUM_HILOS_OPENCV = 1
 
-# Dimensión máxima de la imagen en píxeles (2500px = >300 DPI)
-MAX_DIM_IMAGEN = 2500
+# Ancho máximo de la imagen en píxeles (2480px = ancho A4 a 300 DPI)
+MAX_ANCHO_IMAGEN = 2480
 
-# Calidad de compresión JPEG (1 a 100)
-CALIDAD_JPEG = 88
+# Dimensión máxima de trabajo para OpenCV (3508px = alto A4 a 300 DPI)
+MAX_DIMENSION_IMAGEN = 3508
+
+# Calidad de compresión JPEG (1 a 100) y DPI incrustado
+CALIDAD_JPEG = 85
+JPEG_DPI = (300, 300)
 
 # Liberar memoria RAM automáticamente tras cada página
 LIMPIAR_RAM_POR_PAGINA = True
+
+# Límites del endpoint
+MAX_CANTIDAD_FOTOS = 50
+MAX_BYTES_POR_FOTO = 25 * 1024 * 1024   # 25 MB
+MAX_BYTES_TOTALES = 100 * 1024 * 1024   # 100 MB
+FORMATOS_IMAGEN_PERMITIDOS = {"JPEG", "PNG", "WEBP", "HEIC", "HEIF"}
 ```
 
 ---
@@ -88,3 +98,15 @@ def convertir_adjuntos_odoo_a_pdf(registros_adjuntos_odoo):
     pdf_bytes = img2pdf.convert(buffers_jpeg_procesados)
     return base64.b64encode(pdf_bytes)
 ```
+
+---
+
+## 🌐 Integración como endpoint web (`/api/gd/imagenes_pdf`)
+
+El motor expone helpers para validar el multipart y generar el PDF. El backend debe montar el endpoint HTTP. Ver `AGENTS.md` para:
+
+- Ejemplos de integración en **FastAPI** y **Flask**.
+- Configuración de **timeouts** (Gunicorn/Uvicorn/Nginx) a ≥180 s.
+- Límite de **multipart a 100 MB**.
+- Contrato de errores `{"success": false, "message": "..."}`.
+- Limpieza periódica de PDFs huérfanos si se decide usar `job_id` + polling.

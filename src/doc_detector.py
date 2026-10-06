@@ -18,7 +18,10 @@ import os
 import cv2
 import numpy as np
 
-from . import config
+try:
+    from . import config
+except (ImportError, ValueError):
+    import config
 
 try:
     import onnxruntime as ort

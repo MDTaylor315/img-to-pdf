@@ -10,11 +10,16 @@ import os
 # RECOMENDACIÓN EN HORA PUNTA: Setear a 1 para evitar saturación de vCPUs concurrentes.
 NUM_HILOS_OPENCV = 1
 
-# Dimensión máxima en píxeles (ancho o alto) para redimensionar la imagen HD.
-# 2500 px = Calidad súper HD >300 DPI.
-# TIP HORA PUNTA: Si el servidor recibe muchas peticiones simultáneas, 
+# Ancho máximo en píxeles para redimensionar la imagen HD antes de empaquetarla al PDF.
+# 2480 px = ancho de una hoja A4 a 300 dpi.
+# TIP HORA PUNTA: Si el servidor recibe muchas peticiones simultáneas,
 # puedes reducirlo a 1800 px para acelerar el procesamiento un 40% adicional.
-MAX_DIM_IMAGEN = 2500
+MAX_ANCHO_IMAGEN = 2480
+
+# Dimensión máxima (ancho o alto) permitida durante el procesamiento OpenCV.
+# 3508 px = alto de una hoja A4 a 300 dpi. Sirve para evitar costos excesivos
+# con fotos de muy alta resolución antes del re-encodeo final con Pillow.
+MAX_DIMENSION_IMAGEN = 3508
 
 # Dimensión máxima de la miniatura para análisis rápido de contornos.
 MAX_DIM_MINIATURA_ANALISIS = 800
@@ -28,8 +33,11 @@ LIMPIAR_RAM_POR_PAGINA = True
 
 # --- PARAMETROS DE CALIDAD Y COMPRESIÓN ---
 # Calidad de compresión JPEG guardado en RAM (1 a 100).
-# 84 - 88: Balance perfecto de nitidez en firmas/texto con bajo peso (~200 KB por hoja).
-CALIDAD_JPEG = 95
+# 85: Balance perfecto de nitidez en firmas/texto con bajo peso (~400-700 KB por hoja A4).
+CALIDAD_JPEG = 85
+
+# Resolución lógica incrustada en el JPEG/PDF para impresión a 300 dpi.
+JPEG_DPI = (300, 300)
 
 # Modo de procesamiento por defecto:
 # - "magico": Escáner HD profesional (fondo blanco pulcro, texto y sellos oscuros).
@@ -83,9 +91,16 @@ FUERZA_NITIDEZ = 1.2
 # --- VALIDACIONES DE ENTRADA DEL ENDPOINT ---
 # Límites para evitar que una petición consuma demasiada memoria o CPU.
 MAX_CANTIDAD_FOTOS = 50
-MAX_BYTES_POR_FOTO = 10 * 1024 * 1024
-MAX_BYTES_TOTALES = 50 * 1024 * 1024
+MAX_BYTES_POR_FOTO = 25 * 1024 * 1024
+MAX_BYTES_TOTALES = 100 * 1024 * 1024
 MAX_PIXELES_POR_FOTO = 25_000_000
 
-# Formatos que el pipeline acepta después de inspeccionar el contenido real.
-FORMATOS_IMAGEN_PERMITIDOS = frozenset({"JPEG", "PNG", "WEBP"})
+# Hilos de procesamiento paralelo por request (1 = secuencial).
+# Cada hilo procesa una foto completa. Aumenta el pico de RAM y CPU,
+# pero reduce el wall-clock de un lote. Ajustar según vCPUs/RAM del servidor.
+# Default conservador (2) para servidores con poca RAM o alta carga.
+MAX_WORKERS_PROCESAMIENTO = 2
+
+# Formatos que el pipeline acepta. El endpoint debe aceptar por extensión y delegar
+# la validación de contenido a Pillow/OpenCV. HEIC/HEIF requieren pillow-heif instalado.
+FORMATOS_IMAGEN_PERMITIDOS = frozenset({"JPEG", "PNG", "WEBP", "HEIC", "HEIF"})
