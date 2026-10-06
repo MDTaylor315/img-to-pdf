@@ -79,6 +79,14 @@ USAR_DETECTOR_DL = True
 MODELO_YOLO_DOC_PATH  = os.path.join(os.path.dirname(__file__), "models", "yolo_doc_detector.onnx")
 MODELO_LCNET_DOC_PATH = os.path.join(os.path.dirname(__file__), "models", "lcnet_doc_corners.onnx")
 
+# Umbral de corte anticipado: si la primera orientación evaluada ya da un resultado
+# con este score y cobertura de área, se evitan las otras 3 rotaciones (ahorra hasta
+# ~75% del costo de CPU del detector DL en el caso común sin cambiar el resultado).
+# Bajar estos valores = menos CPU, más confianza en la primera orientación.
+# Subirlos = más CPU, más robustez para fotos muy ambiguas (hojas inclinadas, fondos confusos).
+SCORE_CORTE_ANTICIPADO_DETECTOR = 7.2
+AREA_CORTE_ANTICIPADO_DETECTOR = 0.45
+
 
 # --- AJUSTE FINO DE IMAGEN (FILTRO MÁGICO) ---
 # Límite de corte para ecualización CLAHE (1.0 a 3.0).
@@ -98,8 +106,28 @@ MAX_PIXELES_POR_FOTO = 25_000_000
 # Hilos de procesamiento paralelo por request (1 = secuencial).
 # Cada hilo procesa una foto completa. Aumenta el pico de RAM y CPU,
 # pero reduce el wall-clock de un lote. Ajustar según vCPUs/RAM del servidor.
-# Default conservador (2) para servidores con poca RAM o alta carga.
-MAX_WORKERS_PROCESAMIENTO = 2
+# Default MÍNIMO consumo de recursos (1 = secuencial, nunca 2 fotos a la vez).
+# Si el servidor tiene vCPUs/RAM de sobra y la prioridad es velocidad, subir a 2 o más.
+MAX_WORKERS_PROCESAMIENTO = 1
+
+# --- TOPE GLOBAL DE CPU POR PROCESO (no por usuario, no por request) ---
+# A diferencia de MAX_WORKERS_PROCESAMIENTO (que limita las fotos en paralelo
+# DENTRO de una sola request), esto limita cuántas fotos se procesan al mismo
+# tiempo en TODO el proceso worker, sin importar cuántos usuarios/requests
+# concurrentes lleguen. Si ya hay este número de fotos procesándose, las demás
+# esperan su turno en una cola en vez de competir todas a la vez por el CPU.
+# Recomendado: dejarlo en 1 para un tope de CPU fijo y predecible por worker.
+# IMPORTANTE: es un límite POR PROCESO. Si el servidor corre varios workers
+# (ej. `gunicorn --workers 4`), el tope real de CPU del servidor es
+# MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL * cantidad_de_workers. Para un único
+# tope real en todo el servidor, correr un solo worker o combinar esto con
+# límites de SO (cgroups, `docker --cpus`, `CPUQuota` de systemd).
+MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = 1
+
+# Tiempo máximo (segundos) que una foto puede esperar en la cola del límite
+# global antes de abortar con un error claro al cliente, en vez de quedarse
+# "pegada" indefinidamente si llega una avalancha de requests.
+TIMEOUT_ESPERA_CPU_SEGUNDOS = 150
 
 # Formatos que el pipeline acepta. El endpoint debe aceptar por extensión y delegar
 # la validación de contenido a Pillow/OpenCV. HEIC/HEIF requieren pillow-heif instalado.

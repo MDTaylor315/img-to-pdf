@@ -2,6 +2,8 @@ import os
 import io
 import gc
 import cv2
+import threading
+import multiprocessing
 import numpy as np
 import img2pdf
 from concurrent.futures import ThreadPoolExecutor
@@ -49,6 +51,37 @@ class ErrorValidacionEntrada(ValueError):
         self.mensaje = mensaje
         self.codigo = codigo
         super().__init__(mensaje)
+
+
+# ------------------------------------------------------------------------------
+# LÍMITE GLOBAL DE CPU — compartido entre TODOS los workers del servidor
+# ------------------------------------------------------------------------------
+# Odoo (y Gunicorn con workers síncronos) usan un modelo "prefork": el proceso
+# master carga los addons/módulos UNA vez y luego hace fork() a N procesos
+# worker del sistema operativo (ej. `workers = 7` en odoo.conf). Cada worker
+# atiende una request a la vez, pero son procesos completamente separados que
+# NO comparten memoria entre sí.
+#
+# Por eso usamos multiprocessing.Semaphore en vez de threading.Semaphore: es
+# un semáforo real del sistema operativo (no un objeto Python en RAM), creado
+# aquí quando se importa este módulo — es decir, en el proceso MASTER, ANTES
+# del fork(). Al hacer fork(), cada worker hereda el MISMO semáforo del SO,
+# así que el límite es realmente único y global entre los N workers, sin
+# importar cuántos usuarios/requests concurrentes lleguen.
+#
+# Si por algún motivo el entorno no soporta semáforos POSIX (poco común),
+# caemos a threading.Semaphore como respaldo, pero en ese caso el límite
+# vuelve a ser por proceso, no global entre workers.
+_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = getattr(config, "MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL", 1)
+try:
+    _SEMAFORO_GLOBAL_PROCESAMIENTO = multiprocessing.Semaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
+except Exception:
+    _SEMAFORO_GLOBAL_PROCESAMIENTO = threading.BoundedSemaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
+
+# Tiempo máximo que una foto puede esperar en la cola antes de abortar con un
+# error claro, en vez de quedarse "pegada" indefinidamente si el servidor
+# recibe una avalancha de requests.
+_TIMEOUT_ESPERA_CPU_SEGUNDOS = getattr(config, "TIMEOUT_ESPERA_CPU_SEGUNDOS", 150)
 
 
 def redimensionar_si_es_necesario(imagen_bgr, max_dim=config.MAX_DIMENSION_IMAGEN):
@@ -952,6 +985,37 @@ def procesar_imagen_a_bytes(
 ):
     """
     Procesa una sola foto y devuelve los bytes JPEG comprimidos en memoria RAM.
+
+    Antes de hacer el trabajo pesado, toma un turno del semáforo GLOBAL del
+    proceso (compartido por todas las requests, no solo por las fotos de un
+    mismo usuario). Si ya hay `MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL` fotos
+    procesándose en este worker, esta llamada espera en cola en vez de sumarse
+    y disparar el uso de CPU. Si la espera supera `TIMEOUT_ESPERA_CPU_SEGUNDOS`,
+    aborta con un error claro en vez de quedarse colgada indefinidamente.
+    """
+    adquirido = _SEMAFORO_GLOBAL_PROCESAMIENTO.acquire(timeout=_TIMEOUT_ESPERA_CPU_SEGUNDOS)
+    if not adquirido:
+        raise ErrorValidacionEntrada(
+            "El servidor está saturado procesando otras fotos en este momento. "
+            "Por favor intenta de nuevo en unos segundos.",
+            codigo=503,
+        )
+    try:
+        return _procesar_imagen_a_bytes_interno(
+            origen_imagen, modo=modo, auto_crop=auto_crop, auto_orientar=auto_orientar
+        )
+    finally:
+        _SEMAFORO_GLOBAL_PROCESAMIENTO.release()
+
+
+def _procesar_imagen_a_bytes_interno(
+    origen_imagen,
+    modo=config.MODO_PROCESAMIENTO_DEFECTO,
+    auto_crop=config.USAR_AUTO_CROP_DEFECTO,
+    auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
+):
+    """
+    Lógica real de procesamiento de una foto (sin el control de concurrencia global).
     Libera inmediatamente las matrices pesadas de OpenCV para mantener el uso de RAM al mínimo.
     """
     img_bgr = cargar_imagen_corregida_exif(origen_imagen)
