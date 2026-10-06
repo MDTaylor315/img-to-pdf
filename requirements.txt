@@ -3,4 +3,4 @@ numpy
 Pillow
 img2pdf
 onnxruntime
-pillow-heif>=0.16.0
+pillow-heif==0.12.0

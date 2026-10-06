@@ -7,6 +7,14 @@ import img2pdf
 from concurrent.futures import ThreadPoolExecutor
 from PIL import Image, ImageOps
 
+try:
+    # En pillow-heif 0.12.0+ es necesario registrar el opener para que Pillow
+    # pueda abrir imágenes HEIC/HEIF. En versiones más recientes sigue funcionando.
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except Exception:
+    pass
+
 import importlib
 
 # Detector de esquinas via Deep Learning (ONNX) — Tier 0

@@ -192,10 +192,12 @@ Recomendaciones:
 
 ## Dependencias
 
-Para HEIC/HEIF instalar:
+Para HEIC/HEIF instalar la versión compatible con el ambiente del backend (por ejemplo, `0.12.0`):
 
 ```bash
-pip install pillow-heif
+pip install pillow-heif==0.12.0
 ```
 
-Actualizar `requirements.txt` si se añade al backend.
+El `requirements.txt` actual utiliza `pillow-heif==0.12.0`. Si se instala, `pipeline.py` registra el opener automáticamente para que Pillow pueda abrir archivos `.heic`/`.heif`.
+
+Nota: en Windows con Python 3.13 puede no haber wheel pre-compilado para `0.12.0`; en el ambiente de producción del backend debe verificar que la versión se instale correctamente.
