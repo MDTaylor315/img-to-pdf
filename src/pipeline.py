@@ -44,6 +44,9 @@ except Exception:
 
 import importlib
 
+import logging
+_logger = logging.getLogger(__name__)
+
 # Detector de esquinas via Deep Learning (ONNX) — Tier 0
 try:
     from . import doc_detector as _doc_detector
@@ -100,16 +103,22 @@ class ErrorValidacionEntrada(ValueError):
 _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = getattr(config, "MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL", 1)
 try:
     _SEMAFORO_GLOBAL_PROCESAMIENTO = multiprocessing.Semaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
-    print(f"[img-to-pdf] Límite global de CPU activo: multiprocessing.Semaphore "
-          f"(compartido entre todos los workers), cupo={_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL}")
+    _logger.info(
+        "[img-to-pdf] Límite global de CPU activo: multiprocessing.Semaphore "
+        "(compartido entre todos los workers), cupo=%s",
+        _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL,
+    )
 except Exception as e:
     # IMPORTANTE: si esto se dispara, el límite deja de ser global entre workers
     # y pasa a ser solo por proceso. No lo silenciamos para poder detectarlo en
     # los logs de arranque de Odoo.
     _SEMAFORO_GLOBAL_PROCESAMIENTO = threading.BoundedSemaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
-    print(f"[img-to-pdf] ADVERTENCIA: no se pudo crear multiprocessing.Semaphore ({e}). "
-          f"Usando threading.Semaphore como respaldo: el límite de CPU será SOLO POR "
-          f"PROCESO, no global entre los workers de Odoo. cupo={_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL}")
+    _logger.warning(
+        "[img-to-pdf] ADVERTENCIA: no se pudo crear multiprocessing.Semaphore (%s). "
+        "Usando threading.Semaphore como respaldo: el límite de CPU será SOLO POR "
+        "PROCESO, no global entre los workers de Odoo. cupo=%s",
+        e, _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL,
+    )
 
 # Tiempo máximo que una foto puede esperar en la cola antes de abortar con un
 # error claro, en vez de quedarse "pegada" indefinidamente si el servidor
