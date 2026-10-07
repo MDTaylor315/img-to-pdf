@@ -1,4 +1,29 @@
 import os
+
+# ------------------------------------------------------------------------------
+# LÍMITE DE HILOS DE BLAS/NUMPY (defensivo, best-effort)
+# ------------------------------------------------------------------------------
+# NumPy usa por debajo una librería de álgebra lineal (OpenBLAS/MKL) que por
+# defecto intenta usar TODOS los núcleos disponibles en operaciones como
+# np.linalg.norm, np.dot, etc. Eso puede hacer que el proceso use más CPU del
+# que nuestro semáforo/NUM_HILOS_OPENCV pretenden permitir, ya que ese límite
+# solo cubre OpenCV y ONNX Runtime, no a NumPy/BLAS.
+#
+# Estas variables de entorno solo tienen efecto si se definen ANTES de que la
+# librería BLAS se inicialice por primera vez en el proceso. Si Odoo (u otro
+# addon) ya importó numpy antes de cargar este módulo, esto no tendrá efecto
+# aquí — para una garantía real, deben definirse a nivel de sistema operativo,
+# por ejemplo en el .service de systemd de Odoo:
+#   Environment=OMP_NUM_THREADS=1
+#   Environment=OPENBLAS_NUM_THREADS=1
+#   Environment=MKL_NUM_THREADS=1
+#   Environment=NUMEXPR_NUM_THREADS=1
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
 import io
 import gc
 import cv2
@@ -75,8 +100,16 @@ class ErrorValidacionEntrada(ValueError):
 _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = getattr(config, "MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL", 1)
 try:
     _SEMAFORO_GLOBAL_PROCESAMIENTO = multiprocessing.Semaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
-except Exception:
+    print(f"[img-to-pdf] Límite global de CPU activo: multiprocessing.Semaphore "
+          f"(compartido entre todos los workers), cupo={_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL}")
+except Exception as e:
+    # IMPORTANTE: si esto se dispara, el límite deja de ser global entre workers
+    # y pasa a ser solo por proceso. No lo silenciamos para poder detectarlo en
+    # los logs de arranque de Odoo.
     _SEMAFORO_GLOBAL_PROCESAMIENTO = threading.BoundedSemaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
+    print(f"[img-to-pdf] ADVERTENCIA: no se pudo crear multiprocessing.Semaphore ({e}). "
+          f"Usando threading.Semaphore como respaldo: el límite de CPU será SOLO POR "
+          f"PROCESO, no global entre los workers de Odoo. cupo={_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL}")
 
 # Tiempo máximo que una foto puede esperar en la cola antes de abortar con un
 # error claro, en vez de quedarse "pegada" indefinidamente si el servidor
