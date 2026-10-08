@@ -82,48 +82,131 @@ class ErrorValidacionEntrada(ValueError):
 
 
 # ------------------------------------------------------------------------------
-# LÍMITE GLOBAL DE CPU — compartido entre TODOS los workers del servidor
+# LÍMITE GLOBAL DE CPU — tope real compartido entre TODOS los workers del servidor
 # ------------------------------------------------------------------------------
-# Odoo (y Gunicorn con workers síncronos) usan un modelo "prefork": el proceso
-# master carga los addons/módulos UNA vez y luego hace fork() a N procesos
-# worker del sistema operativo (ej. `workers = 7` en odoo.conf). Cada worker
-# atiende una request a la vez, pero son procesos completamente separados que
-# NO comparten memoria entre sí.
+# Odoo usa un modelo "prefork": el proceso master hace fork() a N procesos
+# worker del SO (ej. `workers = 7` en odoo.conf). Cada worker atiende una
+# request a la vez y son procesos SEPARADOS que no comparten memoria.
 #
-# Por eso usamos multiprocessing.Semaphore en vez de threading.Semaphore: es
-# un semáforo real del sistema operativo (no un objeto Python en RAM), creado
-# aquí quando se importa este módulo — es decir, en el proceso MASTER, ANTES
-# del fork(). Al hacer fork(), cada worker hereda el MISMO semáforo del SO,
-# así que el límite es realmente único y global entre los N workers, sin
-# importar cuántos usuarios/requests concurrentes lleguen.
+# OBJETIVO: garantizar que NUNCA haya más de N lotes de fotos procesándose al
+# mismo tiempo en TODO el servidor (no por worker, no por usuario). Con N=1,
+# un solo lote ocupa su cupo de CPU (~50% del entorno de test) y cualquier otra
+# request que llegue mientras tanto ESPERA su turno, en vez de sumar más carga
+# y trepar el CPU. Así el consumo se mantiene en un techo fijo y predecible, sin
+# quitarle recursos al resto del ERP.
 #
-# Si por algún motivo el entorno no soporta semáforos POSIX (poco común),
-# caemos a threading.Semaphore como respaldo, pero en ese caso el límite
-# vuelve a ser por proceso, no global entre workers.
+# POR QUÉ UN FILE-LOCK Y NO multiprocessing.Semaphore:
+# multiprocessing.Semaphore solo se comparte entre procesos que lo heredan por
+# fork() desde un ancestro común. En Odoo, cada worker importa el addon de forma
+# perezosa DESPUÉS del fork, así que cada worker crearía su PROPIO semáforo y el
+# límite NO sería global entre los 7 workers (daría una falsa sensación de tope).
+# Un lock sobre un archivo (fcntl/flock) es un recurso del sistema operativo
+# identificado por su RUTA: todos los workers que abren el mismo archivo
+# comparten el MISMO lock, sin importar cuándo importaron el módulo. Es un tope
+# real y global, sin dependencias externas (fcntl es de la stdlib en Linux).
+#
+# En Windows (desarrollo local) no existe fcntl; ahí caemos a un
+# multiprocessing.Semaphore, suficiente para pruebas locales de un solo proceso.
 _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = getattr(config, "MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL", 1)
-try:
-    _SEMAFORO_GLOBAL_PROCESAMIENTO = multiprocessing.Semaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
-    _logger.info(
-        "[img-to-pdf] Límite global de CPU activo: multiprocessing.Semaphore "
-        "(compartido entre todos los workers), cupo=%s",
-        _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL,
-    )
-except Exception as e:
-    # IMPORTANTE: si esto se dispara, el límite deja de ser global entre workers
-    # y pasa a ser solo por proceso. No lo silenciamos para poder detectarlo en
-    # los logs de arranque de Odoo.
-    _SEMAFORO_GLOBAL_PROCESAMIENTO = threading.BoundedSemaphore(_MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL)
-    _logger.warning(
-        "[img-to-pdf] ADVERTENCIA: no se pudo crear multiprocessing.Semaphore (%s). "
-        "Usando threading.Semaphore como respaldo: el límite de CPU será SOLO POR "
-        "PROCESO, no global entre los workers de Odoo. cupo=%s",
-        e, _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL,
-    )
-
-# Tiempo máximo que una foto puede esperar en la cola antes de abortar con un
-# error claro, en vez de quedarse "pegada" indefinidamente si el servidor
-# recibe una avalancha de requests.
 _TIMEOUT_ESPERA_CPU_SEGUNDOS = getattr(config, "TIMEOUT_ESPERA_CPU_SEGUNDOS", 150)
+
+try:
+    import fcntl as _fcntl
+    _TIENE_FCNTL = True
+except ImportError:
+    _fcntl = None
+    _TIENE_FCNTL = False
+
+
+class _ColaProcesamientoLlena(Exception):
+    """El cupo global está ocupado y se agotó el tiempo de espera."""
+
+
+class _GateConcurrenciaGlobal:
+    """
+    Limita a N el número de lotes procesándose a la vez en TODO el servidor.
+
+    En Linux usa N archivos de lock (uno por "cupo"): adquirir = tomar un lock
+    exclusivo no bloqueante sobre alguno de los N archivos. Si los N están
+    tomados, reintenta hasta `timeout` y, si no consigue cupo, lanza
+    _ColaProcesamientoLlena. Como el lock lo gestiona el kernel por ruta de
+    archivo, es compartido por todos los workers de Odoo automáticamente.
+
+    En plataformas sin fcntl (Windows), cae a un multiprocessing.Semaphore
+    (válido solo dentro de un mismo árbol de procesos; alcanza para desarrollo).
+    """
+
+    def __init__(self, cupo, timeout):
+        self._cupo = max(1, int(cupo))
+        self._timeout = timeout
+        self._modo_fcntl = _TIENE_FCNTL
+
+        if self._modo_fcntl:
+            import tempfile
+            base = os.path.join(tempfile.gettempdir(), "img_to_pdf_cpu_gate")
+            self._rutas = ["%s_%d.lock" % (base, i) for i in range(self._cupo)]
+            _logger.info(
+                "[img-to-pdf] Límite global de CPU activo: file-lock (fcntl), "
+                "cupo=%s, archivos=%s",
+                self._cupo, self._rutas,
+            )
+        else:
+            self._semaforo = multiprocessing.Semaphore(self._cupo)
+            _logger.warning(
+                "[img-to-pdf] fcntl no disponible (SO no-Unix). Usando "
+                "multiprocessing.Semaphore: el límite sólo es válido dentro de "
+                "un mismo árbol de procesos. cupo=%s",
+                self._cupo,
+            )
+
+    def _intentar_tomar_fcntl(self):
+        """Intenta tomar uno de los N locks sin bloquear. Devuelve el fd o None."""
+        for ruta in self._rutas:
+            fd = os.open(ruta, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                os.close(fd)
+        return None
+
+    def adquirir(self):
+        """
+        Reserva un cupo. Devuelve un 'handle' que luego debe pasarse a liberar().
+        Lanza _ColaProcesamientoLlena si no hay cupo tras `timeout` segundos.
+        """
+        if not self._modo_fcntl:
+            if self._semaforo.acquire(timeout=self._timeout):
+                return "semaforo"
+            raise _ColaProcesamientoLlena()
+
+        import time as _time
+        inicio = _time.time()
+        espera = 0.25
+        while True:
+            fd = self._intentar_tomar_fcntl()
+            if fd is not None:
+                return fd
+            if _time.time() - inicio >= self._timeout:
+                raise _ColaProcesamientoLlena()
+            _time.sleep(espera)
+            espera = min(espera * 1.5, 2.0)  # backoff suave hasta 2s
+
+    def liberar(self, handle):
+        if handle is None:
+            return
+        if not self._modo_fcntl:
+            self._semaforo.release()
+            return
+        try:
+            _fcntl.flock(handle, _fcntl.LOCK_UN)
+        finally:
+            os.close(handle)
+
+
+_GATE_GLOBAL = _GateConcurrenciaGlobal(
+    _MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL, _TIMEOUT_ESPERA_CPU_SEGUNDOS
+)
 
 
 def redimensionar_si_es_necesario(imagen_bgr, max_dim=config.MAX_DIMENSION_IMAGEN):
@@ -1028,26 +1111,15 @@ def procesar_imagen_a_bytes(
     """
     Procesa una sola foto y devuelve los bytes JPEG comprimidos en memoria RAM.
 
-    Antes de hacer el trabajo pesado, toma un turno del semáforo GLOBAL del
-    proceso (compartido por todas las requests, no solo por las fotos de un
-    mismo usuario). Si ya hay `MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL` fotos
-    procesándose en este worker, esta llamada espera en cola en vez de sumarse
-    y disparar el uso de CPU. Si la espera supera `TIMEOUT_ESPERA_CPU_SEGUNDOS`,
-    aborta con un error claro en vez de quedarse colgada indefinidamente.
+    NOTA sobre el control de concurrencia: el tope global de CPU se aplica a
+    nivel de LOTE (una request completa) en `convertir_imagenes_a_pdf_bytes`,
+    no por foto. Así, un lote entero cuenta como UNA unidad que ocupa el cupo
+    global, y las fotos de ese mismo lote se procesan en serie sin volver a
+    pedir turno una por una.
     """
-    adquirido = _SEMAFORO_GLOBAL_PROCESAMIENTO.acquire(timeout=_TIMEOUT_ESPERA_CPU_SEGUNDOS)
-    if not adquirido:
-        raise ErrorValidacionEntrada(
-            "El servidor está saturado procesando otras fotos en este momento. "
-            "Por favor intenta de nuevo en unos segundos.",
-            codigo=503,
-        )
-    try:
-        return _procesar_imagen_a_bytes_interno(
-            origen_imagen, modo=modo, auto_crop=auto_crop, auto_orientar=auto_orientar
-        )
-    finally:
-        _SEMAFORO_GLOBAL_PROCESAMIENTO.release()
+    return _procesar_imagen_a_bytes_interno(
+        origen_imagen, modo=modo, auto_crop=auto_crop, auto_orientar=auto_orientar
+    )
 
 
 def _procesar_imagen_a_bytes_interno(
@@ -1121,149 +1193,43 @@ def convertir_imagenes_a_pdf_bytes(
     Punto de entrada público: convierte una lista de imágenes en los bytes de
     un PDF multipágina.
 
-    Según `config.USAR_SUBPROCESO`, el trabajo pesado se ejecuta:
-      - En un PROCESO HIJO aislado con prioridad de CPU baja (recomendado en
-        servidores como Odoo, para no competir con el resto del ERP), o
-      - Inline, dentro del proceso actual (comportamiento clásico / fallback).
+    CONTROL DE CONCURRENCIA (clave para no saturar el servidor):
+    Antes de procesar, toma UN cupo del tope global de CPU (file-lock
+    compartido por todos los workers de Odoo). Con cupo=1, un solo lote se
+    procesa a la vez en TODO el servidor; cualquier otra request que llegue
+    mientras tanto ESPERA su turno hasta `TIMEOUT_ESPERA_CPU_SEGUNDOS`. Si se
+    agota la espera, aborta con un 503 claro ("servidor ocupado, reintentá")
+    en vez de sumar carga y disparar el CPU. Así el consumo se mantiene en un
+    techo fijo y predecible, sin quitarle recursos al resto del ERP.
 
-    La firma y el valor de retorno son idénticos en ambos modos, así que el
-    controlador HTTP no necesita enterarse de cuál está activo.
+    El cupo se toma a nivel de LOTE (una request = una unidad), no por foto:
+    las fotos del mismo lote se procesan en serie dentro del cupo ya reservado.
     """
     if not lista_origenes_imagenes:
         raise ValueError("Debe proporcionar al menos una imagen.")
 
-    if getattr(config, "USAR_SUBPROCESO", False):
-        return _convertir_en_subproceso(
+    try:
+        handle = _GATE_GLOBAL.adquirir()
+    except _ColaProcesamientoLlena:
+        raise ErrorValidacionEntrada(
+            "El servidor está ocupado procesando otras imágenes en este "
+            "momento. Por favor vuelve a intentarlo en unos segundos.",
+            codigo=503,
+        )
+
+    try:
+        return _procesar_lote_inline(
             lista_origenes_imagenes,
             modo=modo,
             auto_crop=auto_crop,
             auto_orientar=auto_orientar,
             max_workers=max_workers,
-        )
-
-    return _convertir_imagenes_a_pdf_bytes_inline(
-        lista_origenes_imagenes,
-        modo=modo,
-        auto_crop=auto_crop,
-        auto_orientar=auto_orientar,
-        max_workers=max_workers,
-    )
-
-
-# -----------------------------------------------------------------------------
-# AISLAMIENTO EN PROCESO HIJO
-# -----------------------------------------------------------------------------
-def _entrypoint_subproceso(cola_resultado, lista_origenes_imagenes, modo, auto_crop, auto_orientar, max_workers):
-    """
-    Punto de entrada que corre DENTRO del proceso hijo.
-
-    Lo primero que hace es bajar su propia prioridad de CPU (nice), de forma que
-    el sistema operativo le dé menos tiempo de CPU cuando el servidor esté bajo
-    carga. Luego procesa las fotos y devuelve el PDF (o el error) al proceso
-    padre a través de la cola.
-
-    IMPORTANTE: todo lo que viaje por la cola debe ser serializable (picklable).
-    Por eso devolvemos bytes del PDF o una tupla (tipo_error, mensaje, codigo),
-    nunca objetos vivos de OpenCV/Pillow.
-    """
-    try:
-        # Bajar prioridad de CPU. os.nice solo existe en Unix; en Windows se
-        # omite (el subproceso igual funciona, solo que sin ajuste de prioridad).
-        try:
-            if hasattr(os, "nice"):
-                os.nice(getattr(config, "NICE_SUBPROCESO", 10))
-        except Exception:
-            # Si no se pudo ajustar la prioridad (permisos, SO), seguimos igual:
-            # es una optimización, no un requisito de corrección.
-            pass
-
-        pdf_bytes = _convertir_imagenes_a_pdf_bytes_inline(
-            lista_origenes_imagenes,
-            modo=modo,
-            auto_crop=auto_crop,
-            auto_orientar=auto_orientar,
-            max_workers=max_workers,
-        )
-        cola_resultado.put(("ok", pdf_bytes))
-    except ErrorValidacionEntrada as e:
-        cola_resultado.put(("error_validacion", e.mensaje, e.codigo))
-    except Exception as e:
-        cola_resultado.put(("error", "%s: %s" % (type(e).__name__, e)))
-
-
-def _convertir_en_subproceso(
-    lista_origenes_imagenes,
-    modo=config.MODO_PROCESAMIENTO_DEFECTO,
-    auto_crop=config.USAR_AUTO_CROP_DEFECTO,
-    auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
-    max_workers=None,
-):
-    """
-    Ejecuta el procesamiento del lote en un proceso hijo aislado y espera el
-    resultado con un timeout duro. Garantiza que el hijo se termina (kill) pase
-    lo que pase, para no dejar procesos huérfanos acumulándose en el servidor.
-    """
-    # Elección del método de arranque del hijo:
-    #   - 'fork' (default en Linux): el hijo hereda el intérprete ya configurado
-    #     del worker de Odoo (sys.path, el paquete del addon, módulos cargados),
-    #     así que re-importar este módulo nunca falla. Es el más compatible
-    #     dentro de Odoo. Lo lanzamos ANTES de abrir sesiones ONNX / tomar locks
-    #     en esta request, por lo que el riesgo clásico de fork (heredar un lock
-    #     a medio tomar) no aplica aquí.
-    #   - En SO sin fork (Windows, desarrollo local) se usa el método por
-    #     defecto ('spawn'); funciona igual porque este módulo es importable por
-    #     ruta normal.
-    if hasattr(os, "fork"):
-        ctx = multiprocessing.get_context("fork")
-    else:
-        ctx = multiprocessing.get_context()
-
-    cola_resultado = ctx.Queue()
-    proceso = ctx.Process(
-        target=_entrypoint_subproceso,
-        args=(cola_resultado, lista_origenes_imagenes, modo, auto_crop, auto_orientar, max_workers),
-        daemon=True,
-    )
-
-    timeout = getattr(config, "TIMEOUT_SUBPROCESO_SEGUNDOS", 300)
-
-    proceso.start()
-    try:
-        try:
-            resultado = cola_resultado.get(timeout=timeout)
-        except Exception:
-            # Timeout o fallo de comunicación: el hijo no entregó nada a tiempo.
-            raise ErrorValidacionEntrada(
-                "El procesamiento de las imágenes superó el tiempo máximo "
-                "permitido. Por favor intenta con menos fotos o vuelve a "
-                "intentarlo.",
-                codigo=504,
-            )
-
-        tipo = resultado[0]
-        if tipo == "ok":
-            return resultado[1]
-        if tipo == "error_validacion":
-            raise ErrorValidacionEntrada(resultado[1], codigo=resultado[2])
-        # 'error' genérico del hijo
-        raise RuntimeError(
-            "Error procesando las imágenes en el subproceso: %s" % resultado[1]
         )
     finally:
-        # Cleanup garantizado: si el hijo sigue vivo (timeout, excepción en el
-        # padre), lo terminamos para no dejarlo huérfano.
-        if proceso.is_alive():
-            proceso.terminate()
-            proceso.join(timeout=5)
-            if proceso.is_alive():
-                proceso.kill()
-                proceso.join(timeout=5)
-        else:
-            proceso.join(timeout=5)
-        cola_resultado.close()
+        _GATE_GLOBAL.liberar(handle)
 
 
-def _convertir_imagenes_a_pdf_bytes_inline(
+def _procesar_lote_inline(
     lista_origenes_imagenes,
     modo=config.MODO_PROCESAMIENTO_DEFECTO,
     auto_crop=config.USAR_AUTO_CROP_DEFECTO,
@@ -1271,13 +1237,9 @@ def _convertir_imagenes_a_pdf_bytes_inline(
     max_workers=None,
 ):
     """
-    Lógica real de conversión (procesar cada foto + ensamblar el PDF).
-    Corre en el proceso actual. Es llamada directamente cuando USAR_SUBPROCESO
-    es False, o desde dentro del proceso hijo cuando es True.
+    Procesa cada foto y ensambla el PDF. El control de concurrencia global ya
+    fue aplicado por el llamador (`convertir_imagenes_a_pdf_bytes`).
     """
-    if not lista_origenes_imagenes:
-        raise ValueError("Debe proporcionar al menos una imagen.")
-
     # Calentar sesiones ONNX para evitar condiciones de carrera en el pool.
     if getattr(config, "USAR_DETECTOR_DL", True):
         _doc_detector._cargar_modelos()
@@ -1285,7 +1247,7 @@ def _convertir_imagenes_a_pdf_bytes_inline(
         obtener_red_orientacion()
 
     if max_workers is None:
-        # Por defecto usamos el valor de config (4). OpenCV y ONNX liberan el GIL,
+        # Por defecto usamos el valor de config. OpenCV y ONNX liberan el GIL,
         # así que el paralelismo real aprovecha múltiples núcleos sin aumentar NUM_HILOS_OPENCV.
         max_workers = getattr(config, "MAX_WORKERS_PROCESAMIENTO", 4)
         max_workers = min(max_workers, os.cpu_count() or 1)
