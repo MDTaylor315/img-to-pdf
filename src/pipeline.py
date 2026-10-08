@@ -1117,6 +1117,164 @@ def convertir_imagenes_a_pdf_bytes(
     auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
     max_workers=None,
 ):
+    """
+    Punto de entrada público: convierte una lista de imágenes en los bytes de
+    un PDF multipágina.
+
+    Según `config.USAR_SUBPROCESO`, el trabajo pesado se ejecuta:
+      - En un PROCESO HIJO aislado con prioridad de CPU baja (recomendado en
+        servidores como Odoo, para no competir con el resto del ERP), o
+      - Inline, dentro del proceso actual (comportamiento clásico / fallback).
+
+    La firma y el valor de retorno son idénticos en ambos modos, así que el
+    controlador HTTP no necesita enterarse de cuál está activo.
+    """
+    if not lista_origenes_imagenes:
+        raise ValueError("Debe proporcionar al menos una imagen.")
+
+    if getattr(config, "USAR_SUBPROCESO", False):
+        return _convertir_en_subproceso(
+            lista_origenes_imagenes,
+            modo=modo,
+            auto_crop=auto_crop,
+            auto_orientar=auto_orientar,
+            max_workers=max_workers,
+        )
+
+    return _convertir_imagenes_a_pdf_bytes_inline(
+        lista_origenes_imagenes,
+        modo=modo,
+        auto_crop=auto_crop,
+        auto_orientar=auto_orientar,
+        max_workers=max_workers,
+    )
+
+
+# -----------------------------------------------------------------------------
+# AISLAMIENTO EN PROCESO HIJO
+# -----------------------------------------------------------------------------
+def _entrypoint_subproceso(cola_resultado, lista_origenes_imagenes, modo, auto_crop, auto_orientar, max_workers):
+    """
+    Punto de entrada que corre DENTRO del proceso hijo.
+
+    Lo primero que hace es bajar su propia prioridad de CPU (nice), de forma que
+    el sistema operativo le dé menos tiempo de CPU cuando el servidor esté bajo
+    carga. Luego procesa las fotos y devuelve el PDF (o el error) al proceso
+    padre a través de la cola.
+
+    IMPORTANTE: todo lo que viaje por la cola debe ser serializable (picklable).
+    Por eso devolvemos bytes del PDF o una tupla (tipo_error, mensaje, codigo),
+    nunca objetos vivos de OpenCV/Pillow.
+    """
+    try:
+        # Bajar prioridad de CPU. os.nice solo existe en Unix; en Windows se
+        # omite (el subproceso igual funciona, solo que sin ajuste de prioridad).
+        try:
+            if hasattr(os, "nice"):
+                os.nice(getattr(config, "NICE_SUBPROCESO", 10))
+        except Exception:
+            # Si no se pudo ajustar la prioridad (permisos, SO), seguimos igual:
+            # es una optimización, no un requisito de corrección.
+            pass
+
+        pdf_bytes = _convertir_imagenes_a_pdf_bytes_inline(
+            lista_origenes_imagenes,
+            modo=modo,
+            auto_crop=auto_crop,
+            auto_orientar=auto_orientar,
+            max_workers=max_workers,
+        )
+        cola_resultado.put(("ok", pdf_bytes))
+    except ErrorValidacionEntrada as e:
+        cola_resultado.put(("error_validacion", e.mensaje, e.codigo))
+    except Exception as e:
+        cola_resultado.put(("error", "%s: %s" % (type(e).__name__, e)))
+
+
+def _convertir_en_subproceso(
+    lista_origenes_imagenes,
+    modo=config.MODO_PROCESAMIENTO_DEFECTO,
+    auto_crop=config.USAR_AUTO_CROP_DEFECTO,
+    auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
+    max_workers=None,
+):
+    """
+    Ejecuta el procesamiento del lote en un proceso hijo aislado y espera el
+    resultado con un timeout duro. Garantiza que el hijo se termina (kill) pase
+    lo que pase, para no dejar procesos huérfanos acumulándose en el servidor.
+    """
+    # Elección del método de arranque del hijo:
+    #   - 'fork' (default en Linux): el hijo hereda el intérprete ya configurado
+    #     del worker de Odoo (sys.path, el paquete del addon, módulos cargados),
+    #     así que re-importar este módulo nunca falla. Es el más compatible
+    #     dentro de Odoo. Lo lanzamos ANTES de abrir sesiones ONNX / tomar locks
+    #     en esta request, por lo que el riesgo clásico de fork (heredar un lock
+    #     a medio tomar) no aplica aquí.
+    #   - En SO sin fork (Windows, desarrollo local) se usa el método por
+    #     defecto ('spawn'); funciona igual porque este módulo es importable por
+    #     ruta normal.
+    if hasattr(os, "fork"):
+        ctx = multiprocessing.get_context("fork")
+    else:
+        ctx = multiprocessing.get_context()
+
+    cola_resultado = ctx.Queue()
+    proceso = ctx.Process(
+        target=_entrypoint_subproceso,
+        args=(cola_resultado, lista_origenes_imagenes, modo, auto_crop, auto_orientar, max_workers),
+        daemon=True,
+    )
+
+    timeout = getattr(config, "TIMEOUT_SUBPROCESO_SEGUNDOS", 300)
+
+    proceso.start()
+    try:
+        try:
+            resultado = cola_resultado.get(timeout=timeout)
+        except Exception:
+            # Timeout o fallo de comunicación: el hijo no entregó nada a tiempo.
+            raise ErrorValidacionEntrada(
+                "El procesamiento de las imágenes superó el tiempo máximo "
+                "permitido. Por favor intenta con menos fotos o vuelve a "
+                "intentarlo.",
+                codigo=504,
+            )
+
+        tipo = resultado[0]
+        if tipo == "ok":
+            return resultado[1]
+        if tipo == "error_validacion":
+            raise ErrorValidacionEntrada(resultado[1], codigo=resultado[2])
+        # 'error' genérico del hijo
+        raise RuntimeError(
+            "Error procesando las imágenes en el subproceso: %s" % resultado[1]
+        )
+    finally:
+        # Cleanup garantizado: si el hijo sigue vivo (timeout, excepción en el
+        # padre), lo terminamos para no dejarlo huérfano.
+        if proceso.is_alive():
+            proceso.terminate()
+            proceso.join(timeout=5)
+            if proceso.is_alive():
+                proceso.kill()
+                proceso.join(timeout=5)
+        else:
+            proceso.join(timeout=5)
+        cola_resultado.close()
+
+
+def _convertir_imagenes_a_pdf_bytes_inline(
+    lista_origenes_imagenes,
+    modo=config.MODO_PROCESAMIENTO_DEFECTO,
+    auto_crop=config.USAR_AUTO_CROP_DEFECTO,
+    auto_orientar=config.AUTO_ORIENTAR_TEXTO_DEFECTO,
+    max_workers=None,
+):
+    """
+    Lógica real de conversión (procesar cada foto + ensamblar el PDF).
+    Corre en el proceso actual. Es llamada directamente cuando USAR_SUBPROCESO
+    es False, o desde dentro del proceso hijo cuando es True.
+    """
     if not lista_origenes_imagenes:
         raise ValueError("Debe proporcionar al menos una imagen.")
 

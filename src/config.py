@@ -129,6 +129,47 @@ MAX_PROCESAMIENTO_CONCURRENTE_GLOBAL = 1
 # "pegada" indefinidamente si llega una avalancha de requests.
 TIMEOUT_ESPERA_CPU_SEGUNDOS = 150
 
+
+# --- AISLAMIENTO DEL PROCESAMIENTO EN UN PROCESO HIJO ---
+# Cuando corre dentro de un servidor como Odoo (modelo prefork: el proceso
+# master hace fork() a N workers que atienden CUALQUIER request del ERP, no
+# solo las fotos), procesar las imágenes DENTRO del worker tiene dos problemas:
+#   1. Mientras el worker quema CPU convirtiendo fotos, ese mismo proceso no
+#      puede atender otras peticiones del ERP (facturas, reportes, etc.).
+#   2. No se le puede bajar la prioridad de CPU al worker sin degradarlo para
+#      siempre: os.nice() dentro del proceso es irreversible sin privilegios,
+#      y el worker se reutiliza para requests no relacionadas a fotos.
+#
+# Con USAR_SUBPROCESO = True, el trabajo pesado (procesar las fotos + ensamblar
+# el PDF) corre en un PROCESO HIJO separado que:
+#   - Nace con prioridad de CPU baja (NICE_SUBPROCESO): si el servidor está
+#     ocupado con tareas importantes, el SO le da menos CPU automáticamente,
+#     así las fotos ceden el paso al resto del ERP en vez de frenarlo.
+#   - Tiene su propio espacio de memoria: los picos de RAM del procesamiento
+#     NO cuentan contra el watchdog de memoria del worker de Odoo (confirmado:
+#     Odoo mide solo el VMS del PID del worker, sin sumar descendientes).
+#   - Muere al terminar: no deja estado degradado en el worker.
+#
+# Si algo sale mal en un entorno nuevo (test con poca RAM, comportamiento raro
+# del fork dentro de Odoo), poner esto en False devuelve el motor al
+# comportamiento anterior (procesamiento inline dentro del worker) de inmediato,
+# sin tocar código ni redeployar.
+#
+# NOTA: os.nice() solo existe en Unix/Linux. En Windows (desarrollo local) el
+# ajuste de prioridad se omite silenciosamente, pero el subproceso igual
+# funciona. En producción (Linux + systemd) el nice sí aplica.
+USAR_SUBPROCESO = True
+
+# Incremento de "nice" del proceso hijo (0 = prioridad normal, 19 = mínima).
+# 10 es un valor conservador: el procesamiento cede CPU cuando hay contención,
+# pero sigue avanzando a buen ritmo cuando el servidor está ocioso.
+NICE_SUBPROCESO = 10
+
+# Tiempo máximo (segundos) que el worker espera a que el proceso hijo devuelva
+# el PDF antes de abortar y matar al hijo. Evita que el worker quede colgado
+# indefinidamente si el hijo se traba. Debe ser holgado para lotes grandes.
+TIMEOUT_SUBPROCESO_SEGUNDOS = 300
+
 # Formatos que el pipeline acepta. El endpoint debe aceptar por extensión y delegar
 # la validación de contenido a Pillow/OpenCV. HEIC/HEIF requieren pillow-heif instalado.
 FORMATOS_IMAGEN_PERMITIDOS = frozenset({"JPEG", "PNG", "WEBP", "HEIC", "HEIF"})
